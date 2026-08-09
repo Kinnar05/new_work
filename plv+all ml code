@@ -11,6 +11,7 @@ import mne
 import pywt
 import matplotlib.pyplot as plt
 from scipy.stats import skew, kurtosis
+from scipy.signal import hilbert
 from sklearn.base import BaseEstimator, TransformerMixin, ClassifierMixin, clone
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import SelectKBest, mutual_info_classif
@@ -53,6 +54,7 @@ class CONFIG:
     N_CHANNELS: int = 19
     WAVELET: str = "db4"
     WAVELET_LEVEL: int = 3
+    INCLUDE_PLV: bool = True           # append pairwise PLV connectivity features per window
     KLEIN_CURVATURE_GRID: Tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
     SELECT_K_GRID: Tuple = (30, 60, 120, "all")
     N_OUTER_FOLDS: int = 5             # outer loop: unbiased performance estimate
@@ -152,11 +154,52 @@ def wavelet_window_features(window: np.ndarray, wavelet: str, level: int) -> np.
     return np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+# --------------------------------------------------------------------------- #
+# 3b. PLV (Phase Locking Value) connectivity features
+#     Instantaneous phase per channel via the analytic signal (Hilbert
+#     transform), then pairwise PLV across all channel pairs within the
+#     window. Only the upper-triangle (i<j) is kept -- PLV is symmetric and
+#     PLV(i,i)=1 by construction, so the diagonal carries no information.
+# --------------------------------------------------------------------------- #
+def instantaneous_phase(window: np.ndarray) -> np.ndarray:
+    """window: (n_channels, n_samples) -> unwrapped phase, same shape."""
+    analytic = hilbert(window, axis=-1)
+    return np.angle(analytic)
+
+
+def plv_matrix(window: np.ndarray) -> np.ndarray:
+    """Pairwise PLV across channels for one window. Returns (n_ch, n_ch)."""
+    phase = instantaneous_phase(window)          # (n_ch, n_samples)
+    phase_diff = phase[:, None, :] - phase[None, :, :]   # (n_ch, n_ch, n_samples)
+    plv = np.abs(np.mean(np.exp(1j * phase_diff), axis=-1))
+    return plv
+
+
+def plv_window_features(window: np.ndarray) -> np.ndarray:
+    """Upper-triangle (i<j) PLV values for one window, flattened."""
+    n_ch = window.shape[0]
+    plv = plv_matrix(window)
+    iu = np.triu_indices(n_ch, k=1)
+    feats = plv[iu].astype(np.float64)
+    return np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def full_window_features(window: np.ndarray, wavelet: str, level: int, include_plv: bool) -> np.ndarray:
+    """Wavelet/Hjorth features, optionally concatenated with PLV connectivity features."""
+    feats = wavelet_window_features(window, wavelet, level)
+    if include_plv:
+        feats = np.concatenate([feats, plv_window_features(window)])
+    return feats
+
+
 def scale_feature_vector(signal: np.ndarray, sfreq: int, window_sec: int, cfg: CONFIG) -> np.ndarray:
     windows = partition_signal(signal, sfreq, window_sec)
     if not windows:
         raise ValueError(f"recording too short for a {window_sec}s window")
-    feats = np.stack([wavelet_window_features(w, cfg.WAVELET, cfg.WAVELET_LEVEL) for w in windows])
+    feats = np.stack([
+        full_window_features(w, cfg.WAVELET, cfg.WAVELET_LEVEL, cfg.INCLUDE_PLV)
+        for w in windows
+    ])
     return feats.mean(axis=0)
 
 
@@ -570,7 +613,8 @@ def main():
 
     X_by_scale, y, groups = build_dataset(records, CFG)
     print(f"Usable recordings after feature extraction: {len(y)} "
-          f"(feature dim per scale: {X_by_scale[CFG.SCALES_SEC[0]].shape[1]})")
+          f"(feature dim per scale: {X_by_scale[CFG.SCALES_SEC[0]].shape[1]}, "
+          f"PLV included: {CFG.INCLUDE_PLV})")
 
     X_full = np.concatenate([X_by_scale[s] for s in CFG.SCALES_SEC], axis=1)
 
