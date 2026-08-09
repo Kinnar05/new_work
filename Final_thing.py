@@ -86,22 +86,57 @@ def index_dataset(root: str) -> List[Dict]:
 
 # --------------------------------------------------------------------------- #
 # 2. Signal loading + multi-scale windowing
-#    `band` selects which frequency range is used for the bandpass filter --
-#    pass CFG.BANDPASS for the "Whole" broadband condition, or one of
-#    CFG.BANDS[...] for a single-band condition (delta/theta/alpha/beta/gamma).
+#
+#    The EDF file is read from disk exactly TWICE per recording, not once
+#    per frequency condition:
+#      (1) `load_raw_whole()`  -- one disk read, filtered to the broadband
+#          (1-45 Hz) range, used only for the "Whole" condition.
+#      (2) `load_raw_unfiltered()` -- one more disk read, resampled but left
+#          otherwise unfiltered (mne's own anti-aliasing low-pass runs
+#          inside `raw.resample()`), cached in memory, and then split into
+#          the 5 non-overlapping canonical bands via `bandpass_array()`,
+#          which filters the already-loaded numpy array -- no further disk
+#          I/O. This also avoids compounding filter artifacts that would
+#          come from band-filtering an already 1-45 Hz filtered signal.
+#    Net effect: 2 disk reads per recording instead of 6.
 # --------------------------------------------------------------------------- #
-def load_raw(path: str, cfg: CONFIG, band: Optional[Tuple[float, float]] = None) -> np.ndarray:
-    band = band if band is not None else cfg.BANDPASS
+def _read_and_pick(path: str, cfg: CONFIG) -> "mne.io.Raw":
     raw = mne.io.read_raw_edf(path, preload=True, verbose="ERROR")
     raw.pick_types(eeg=True)
     if len(raw.ch_names) < cfg.N_CHANNELS:
         raise ValueError(f"only {len(raw.ch_names)} EEG channels, need {cfg.N_CHANNELS}")
     if len(raw.ch_names) > cfg.N_CHANNELS:
         raw.pick(raw.ch_names[: cfg.N_CHANNELS])
-    raw.filter(band[0], band[1], verbose="ERROR")
+    return raw
+
+
+def load_raw_whole(path: str, cfg: CONFIG) -> np.ndarray:
+    """Single disk read -> broadband (cfg.BANDPASS) filter -> resample.
+    Used only for the 'Whole' condition."""
+    raw = _read_and_pick(path, cfg)
+    raw.filter(cfg.BANDPASS[0], cfg.BANDPASS[1], verbose="ERROR")
     if raw.info["sfreq"] != cfg.SFREQ_TARGET:
         raw.resample(cfg.SFREQ_TARGET, verbose="ERROR")
     return raw.get_data()
+
+
+def load_raw_unfiltered(path: str, cfg: CONFIG) -> Tuple[np.ndarray, float]:
+    """Single disk read -> resample only (no band filter). mne's
+    `raw.resample()` applies its own anti-aliasing low-pass internally, so
+    this is safe to downsample without an explicit bandpass first. The
+    returned array is cached in memory and reused for every band via
+    `bandpass_array()` -- no further disk I/O."""
+    raw = _read_and_pick(path, cfg)
+    if raw.info["sfreq"] != cfg.SFREQ_TARGET:
+        raw.resample(cfg.SFREQ_TARGET, verbose="ERROR")
+    return raw.get_data(), float(raw.info["sfreq"])
+
+
+def bandpass_array(signal: np.ndarray, sfreq: float, band: Tuple[float, float]) -> np.ndarray:
+    """Band-pass filter an already-loaded (n_channels, n_samples) array in
+    memory -- no disk access. Used to split one cached unfiltered signal
+    into the 5 non-overlapping canonical bands."""
+    return mne.filter.filter_data(signal, sfreq, band[0], band[1], verbose="ERROR")
 
 
 def partition_signal(signal: np.ndarray, sfreq: int, window_sec: int) -> List[np.ndarray]:
@@ -207,20 +242,19 @@ def scale_feature_vector(signal: np.ndarray, sfreq: int, window_sec: int, cfg: C
     return feats.mean(axis=0)
 
 
-def build_dataset(records: List[Dict], cfg: CONFIG,
-                   band: Optional[Tuple[float, float]] = None
-                   ) -> Tuple[Dict[int, np.ndarray], np.ndarray, np.ndarray]:
-    """Build the multi-scale feature matrix for a single frequency condition
-    (`band` = None or cfg.BANDPASS -> "Whole"; cfg.BANDS[name] -> single band)."""
+def build_dataset_whole(records: List[Dict], cfg: CONFIG
+                         ) -> Tuple[Dict[int, np.ndarray], np.ndarray, np.ndarray]:
+    """Build the multi-scale feature matrix for the 'Whole' broadband
+    condition. One disk read per recording (load_raw_whole)."""
     X_by_scale = {s: [] for s in cfg.SCALES_SEC}
     y, groups = [], []
     for rec in records:
         try:
-            signal = load_raw(rec["path"], cfg, band=band)
+            signal = load_raw_whole(rec["path"], cfg)
             per_scale = {s: scale_feature_vector(signal, cfg.SFREQ_TARGET, s, cfg)
                          for s in cfg.SCALES_SEC}
         except Exception as exc:
-            print(f"[WARN] skipping {rec['path']}: {exc}")
+            print(f"[WARN] skipping {rec['path']} (Whole): {exc}")
             continue
         for s in cfg.SCALES_SEC:
             X_by_scale[s].append(per_scale[s])
@@ -231,9 +265,50 @@ def build_dataset(records: List[Dict], cfg: CONFIG,
     return X_by_scale, np.array(y), np.array(groups)
 
 
+def build_dataset_all_bands(records: List[Dict], cfg: CONFIG
+                             ) -> Tuple[Dict[str, Dict[int, np.ndarray]], np.ndarray, np.ndarray]:
+    """Build the multi-scale feature matrices for ALL 5 canonical bands in
+    one pass. Each recording is read from disk exactly ONCE
+    (load_raw_unfiltered); the 5 non-overlapping bands are then produced by
+    filtering that single cached array in memory (bandpass_array), so this
+    whole function costs only 1 disk read per recording, not 5.
+
+    Returns {band_name: {scale: X_array}}, y, groups -- same subject/label
+    order is preserved across all bands.
+    """
+    band_names = list(cfg.BANDS.keys())
+    X_by_band_scale = {b: {s: [] for s in cfg.SCALES_SEC} for b in band_names}
+    y, groups = [], []
+    for rec in records:
+        try:
+            signal, sfreq = load_raw_unfiltered(rec["path"], cfg)   # single disk read
+        except Exception as exc:
+            print(f"[WARN] skipping {rec['path']} (load): {exc}")
+            continue
+        try:
+            per_band_scale = {}
+            for band_name, band_range in cfg.BANDS.items():
+                filtered = bandpass_array(signal, sfreq, band_range)   # in-memory filter only
+                per_band_scale[band_name] = {
+                    s: scale_feature_vector(filtered, sfreq, s, cfg) for s in cfg.SCALES_SEC
+                }
+        except Exception as exc:
+            print(f"[WARN] skipping {rec['path']} (band features): {exc}")
+            continue
+        for band_name in band_names:
+            for s in cfg.SCALES_SEC:
+                X_by_band_scale[band_name][s].append(per_band_scale[band_name][s])
+        y.append(rec["label"])
+        groups.append(rec["subject_id"])
+
+    result = {b: {s: np.stack(v) for s, v in X_by_band_scale[b].items()} for b in band_names}
+    return result, np.array(y), np.array(groups)
+
+
 def get_band_conditions(cfg: CONFIG) -> Dict[str, Tuple[float, float]]:
     """Ordered dict of {display_name: (low, high)} -- 'Whole' broadband first,
-    then each canonical band."""
+    then each canonical band. Used only for display/labeling; the actual
+    2-pass loading is handled by build_dataset_whole / build_dataset_all_bands."""
     conditions = {"Whole (1-45 Hz)": cfg.BANDPASS}
     conditions.update({name.capitalize(): rng for name, rng in cfg.BANDS.items()})
     return conditions
@@ -628,16 +703,18 @@ def main():
     print(f"Classifier: Logistic Regression only")
     print(f"Running {CFG.N_REPEATS}x nested CV per condition: "
           f"{CFG.N_OUTER_FOLDS} outer folds x {CFG.N_INNER_FOLDS} inner folds "
-          f"= {CFG.N_REPEATS * CFG.N_OUTER_FOLDS} outer evaluations per condition\n")
+          f"= {CFG.N_REPEATS * CFG.N_OUTER_FOLDS} outer evaluations per condition")
+    print("Disk I/O: each EDF file is read exactly twice total "
+          "(once for 'Whole', once shared across all 5 bands) -- not once per condition.\n")
 
     all_summaries = {}
     all_pooled = {}
     pooled_scores_by_band = {}
     per_band_fold_results = {}
 
-    for band_name, band_range in band_conditions.items():
+    def _evaluate_band(band_name: str, X_by_scale: Dict[int, np.ndarray],
+                        y: np.ndarray, groups: np.ndarray):
         print(f"\n{'=' * 20} {band_name} {'=' * 20}")
-        X_by_scale, y, groups = build_dataset(records, CFG, band=band_range)
         print(f"Usable recordings: {len(y)} "
               f"(feature dim per scale: {X_by_scale[CFG.SCALES_SEC[0]].shape[1]}, "
               f"PLV included: {CFG.INCLUDE_PLV})")
@@ -663,6 +740,18 @@ def main():
         per_band_fold_results[band_name] = fold_results
 
         show_confusion_matrix(band_name, pooled_y_true, pooled_y_pred)
+
+    # ---- Pass 1: "Whole" broadband -- one disk read per recording ---- #
+    whole_name = "Whole (1-45 Hz)"
+    X_by_scale_whole, y_whole, groups_whole = build_dataset_whole(records, CFG)
+    _evaluate_band(whole_name, X_by_scale_whole, y_whole, groups_whole)
+
+    # ---- Pass 2: all 5 canonical bands -- ONE more disk read per
+    # recording, shared across all 5 bands via in-memory filtering. ---- #
+    X_by_band_scale, y_bands, groups_bands = build_dataset_all_bands(records, CFG)
+    for band_key in CFG.BANDS:
+        band_display = band_key.capitalize()
+        _evaluate_band(band_display, X_by_band_scale[band_key], y_bands, groups_bands)
 
     show_roc_overlay(pooled_scores_by_band)
 
