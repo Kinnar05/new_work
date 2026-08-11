@@ -37,7 +37,7 @@ class CONFIG:
     DATA_ROOT: str = "/kaggle/input/datasets/kinnarhalder/eeg-dataset"
     SFREQ_TARGET: int = 128
     BANDS: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
-        "delta": (1.0, 4.0),
+        "delta": (0.5, 4.0),
         "theta": (4.0, 8.0),
         "alpha": (8.0, 13.0),
         "beta": (13.0, 30.0),
@@ -491,7 +491,7 @@ def run_one_outer_fold(band_name: str, X_dev: np.ndarray, y_dev: np.ndarray, gro
     # --- Inner stage 1: hyperparameter search (incl. Klein curvature & scale_factor)
     # on this fold's training data only. ---
     pipe = make_pipeline(n_scales=len(cfg.SCALES_SEC), cfg=cfg)
-    search = GridSearchCV(pipe, grid, cv=inner_cv, scoring="accuracy", n_jobs=-1, refit=False)
+    search = GridSearchCV(pipe, grid, cv=inner_cv, scoring="roc_auc", n_jobs=-1, refit=False)
     search.fit(X_dev, y_dev, groups=groups_dev)
 
     # --- Inner stage 2: freeze hyperparameters, bag the estimator for variance reduction. ---
