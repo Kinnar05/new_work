@@ -113,7 +113,7 @@ class CONFIG:
     KLEIN_SCALE_FACTOR_GRID: Tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
     SATURATION_MARGIN: float = 0.95
     SELECT_K_GRID: Tuple = (30, 60, 120, 240)              # dropped "all" -- selecting "all" of ~10k feats is expensive and rarely wins
-    N_OUTER_FOLDS: int = 5                                 # revisit if a class has <~10 subjects (see note above)
+    N_OUTER_FOLDS: int = 3                                 # revisit if a class has <~10 subjects (see note above)
     N_INNER_FOLDS: int = 3
     N_REPEATS: int = 3
     N_BAGGING_ESTIMATORS: int = 31
