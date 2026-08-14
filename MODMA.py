@@ -1,18 +1,15 @@
 """
-EEG Klein-fusion + PLV + Logistic Regression pipeline -- MODMA adaptation
-==========================================================================
+EEG Klein-fusion + PLV + Logistic Regression pipeline -- MODMA adaptation (128-CHANNEL)
+=========================================================================================
 Adapted from the kinnarhalder/eeg-dataset (19ch EDF) pipeline to run on the
 MODMA 128-channel resting-state dataset
-(EEG_128channels_resting_lanzhou_2015, .mat files), restricted to the 25
-EGI HydroCel channels:
-
-    E68, E69, E70, E72, E65, E95, E61, E76, E86, E111, E66, E81, E116, E103,
-    E97, E82, E91, E83, E30, E77, E59, E52, E112, E127, E105
+(EEG_128channels_resting_lanzhou_2015, .mat files), using ALL 128 EGI
+HydroCel channels (E1..E128) rather than a reduced subset.
 
 ONLY sections 1-2 (data indexing + loading) were rewritten. Sections 3-11
 (feature extraction, Klein hyperbolic fusion, pipeline, nested CV, metrics,
 persistence, plots, main) are unchanged from the EDF version other than
-parameterizing on N_CHANNELS=25 and swapping the loader call.
+parameterizing on N_CHANNELS=128 and swapping the loader call.
 
 >>> BEFORE YOUR FIRST FULL RUN, VERIFY THESE THREE ASSUMPTIONS <<<
 --------------------------------------------------------------------
@@ -38,6 +35,26 @@ open the subjects-information .xlsx once, before trusting a full run:
    it picked -- check that output. If auto-detection fails or mismatches,
    fill `CFG.MANUAL_LABEL_MAP = {"02010005": 0, "02030007": 1, ...}` by
    hand instead.
+
+>>> NOTE ON GOING FROM 25 -> 128 CHANNELS <<<
+--------------------------------------------------------------------
+This is a pure feature-count change, not an algorithmic one -- every
+downstream step (wavelet stats, PLV, Klein fusion, nested CV) is written
+generically over `len(cfg.SELECTED_CHANNELS)` / `cfg.N_CHANNELS`, so no
+other section needed to change. Two things to be aware of, though:
+
+- PLV connectivity features scale as C(n,2): 25 channels -> 300 pairs,
+  128 channels -> 8128 pairs. Combined with wavelet features across 3
+  scales, per-subject feature dimensionality goes up roughly ~17x for
+  the PLV block alone. Expect noticeably longer feature-extraction and
+  SelectKBest/GridSearchCV runtimes, and consider raising the upper end
+  of `SELECT_K_GRID` since 120 may now under-select relative to the
+  much larger feature space.
+- With small sample sizes (typical for MDD EEG cohorts, likely well
+  under 8128 PLV features + wavelet features), the feature-to-sample
+  ratio becomes far more extreme, so the mutual_info SelectKBest step
+  is now doing much more of the heavy lifting against a higher risk of
+  overfitting within each inner fold.
 """
 import os
 import re
@@ -87,6 +104,9 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # --------------------------------------------------------------------------- #
 # CONFIG
 # --------------------------------------------------------------------------- #
+CHANNEL_ORDER_128 = [f"E{i}" for i in range(1, 129)]
+
+
 @dataclass
 class CONFIG:
     DATA_ROOT: str = "/kaggle/input/datasets/kinnarhalder/modmaa/EEG_128channels_resting_lanzhou_2015"
@@ -104,27 +124,26 @@ class CONFIG:
         "delta",
     ))
     SCALES_SEC: Tuple[int, int, int] = (1, 2, 3)
-    # 25 EGI HydroCel channels requested for the MODMA run.
-    SELECTED_CHANNELS: Tuple[str, ...] = field(default_factory=lambda: (
-        "E68", "E69", "E70", "E72", "E65", "E95", "E61", "E76", "E86", "E111",
-        "E66", "E81", "E116", "E103", "E97", "E82", "E91", "E83", "E30", "E77",
-        "E59", "E52", "E112", "E127", "E105",
-    ))
-    N_CHANNELS: int = 25
+    # ALL 128 EGI HydroCel channels (E1..E128) -- full-montage MODMA run.
+    SELECTED_CHANNELS: Tuple[str, ...] = field(default_factory=lambda: tuple(CHANNEL_ORDER_128))
+    N_CHANNELS: int = 128
     WAVELET: str = "db4"
     WAVELET_LEVEL: int = 3
     INCLUDE_PLV: bool = True
     KLEIN_CURVATURE_GRID: Tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
     KLEIN_SCALE_FACTOR_GRID: Tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
     SATURATION_MARGIN: float = 0.95
-    SELECT_K_GRID: Tuple = (30, 60, 120, "all")
+    # Raised upper end vs. the 25-channel version (120) since the full
+    # 128-channel PLV block alone is C(128,2)=8128 features -- 120 would
+    # now under-select relative to the much larger feature space.
+    SELECT_K_GRID: Tuple = (30, 60, 120, 250, 500, "all")
     N_OUTER_FOLDS: int = 5
     N_INNER_FOLDS: int = 3
     N_REPEATS: int = 3
     N_BAGGING_ESTIMATORS: int = 31
     BAGGING_MAX_SAMPLES: float = 0.9
     SEED: int = 42
-    SAVE_DIR: str = "results_modma"
+    SAVE_DIR: str = "results_modma_128ch"
     # values (case-insensitive) treated as "MDD" / "Healthy control" when
     # scanning the subject-info spreadsheet -- extend if the file uses
     # different wording (e.g. "patient" / "depressed" / "case").
@@ -291,11 +310,8 @@ def index_dataset_modma(cfg: CONFIG) -> List[Dict]:
 
 
 # --------------------------------------------------------------------------- #
-# 2. Signal loading + multi-scale windowing (MODMA: .mat, 25 selected channels)
+# 2. Signal loading + multi-scale windowing (MODMA: .mat, all 128 channels)
 # --------------------------------------------------------------------------- #
-CHANNEL_ORDER_128 = [f"E{i}" for i in range(1, 129)]
-
-
 def _egi_channel_order(n_channels_in_file: int) -> List[str]:
     """Standard GSN-HydroCel-129 net channel numbering. ASSUMPTION -- verify
     with inspect_modma_mat_file() that the .mat channel axis actually follows
@@ -851,7 +867,7 @@ def _resolve_bands_to_run(cfg: CONFIG) -> List[str]:
 
 def main():
     print("=" * 100)
-    print("MODMA run -- verify assumptions before trusting results:")
+    print("MODMA run (128-channel, full EGI HydroCel montage) -- verify assumptions before trusting results:")
     print("  1. .mat channel order (E1..E128[+Cz])  -> inspect_modma_mat_file(sample_path)")
     print("  2. sampling rate (falls back to CFG.SFREQ_ORIG if not found in the .mat)")
     print("  3. subject-info label columns           -> inspect_modma_subject_info(CFG)")
@@ -861,7 +877,7 @@ def main():
 
     bands_to_run = _resolve_bands_to_run(CFG)
     print(f"\nBands to run THIS execution: {bands_to_run}")
-    print(f"Channels ({CFG.N_CHANNELS}): {list(CFG.SELECTED_CHANNELS)}")
+    print(f"Channels ({CFG.N_CHANNELS}): full E1..E128 montage")
     print(f"Classifier: Logistic Regression only")
     print(f"Running {CFG.N_REPEATS}x nested CV per band: "
           f"{CFG.N_OUTER_FOLDS} outer folds x {CFG.N_INNER_FOLDS} inner folds "
