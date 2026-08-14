@@ -63,7 +63,7 @@ class CONFIG:
     KLEIN_SCALE_FACTOR_GRID: Tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)   # tau: dimension-aware pre-scale, see module docstring
     SATURATION_MARGIN: float = 0.95                      # boundary-proximity threshold for the saturation-rate diagnostic
     SELECT_K_GRID: Tuple = (30, 60, 120, "all")
-    N_OUTER_FOLDS: int = 5                                # outer loop: unbiased performance estimate
+    N_OUTER_FOLDS: int = 3                                # outer loop: unbiased performance estimate
     N_INNER_FOLDS: int = 3                                # inner loop: hyperparameter + threshold tuning
     N_REPEATS: int = 3                                    # outer (external) evaluation repeated 5x with fresh folds
     N_BAGGING_ESTIMATORS: int = 31                        # bagged over bootstrap resamples of the dev set
