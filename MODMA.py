@@ -1,3 +1,44 @@
+"""
+EEG Klein-fusion + PLV + Logistic Regression pipeline -- MODMA adaptation
+==========================================================================
+Adapted from the kinnarhalder/eeg-dataset (19ch EDF) pipeline to run on the
+MODMA 128-channel resting-state dataset
+(EEG_128channels_resting_lanzhou_2015, .mat files), restricted to the 25
+EGI HydroCel channels:
+
+    E68, E69, E70, E72, E65, E95, E61, E76, E86, E111, E66, E81, E116, E103,
+    E97, E82, E91, E83, E30, E77, E59, E52, E112, E127, E105
+
+ONLY sections 1-2 (data indexing + loading) were rewritten. Sections 3-11
+(feature extraction, Klein hyperbolic fusion, pipeline, nested CV, metrics,
+persistence, plots, main) are unchanged from the EDF version other than
+parameterizing on N_CHANNELS=25 and swapping the loader call.
+
+>>> BEFORE YOUR FIRST FULL RUN, VERIFY THESE THREE ASSUMPTIONS <<<
+--------------------------------------------------------------------
+These could not be confirmed without the actual files, so the code
+auto-detects where it can and falls back to a documented default
+otherwise. Run `inspect_modma_mat_file()` on one sample .mat file, and
+open the subjects-information .xlsx once, before trusting a full run:
+
+1. .mat variable + channel order: `_load_mat_eeg_array()` picks the first
+   2D array with 128 or 129 rows/cols as the EEG data, and assumes
+   channels follow the standard GSN-HydroCel-129 net order E1..E128
+   (+ Cz as channel 129 if present). If this dataset was exported with a
+   different variable name or channel order, fix `_egi_channel_order()`.
+2. Sampling rate: auto-detected from a field named srate/fs/sfreq/
+   sampling_rate/samplerate in the .mat file if present, else falls back
+   to `CFG.SFREQ_ORIG` (default 250 Hz, the rate commonly reported for
+   this Lanzhou 128-channel resting recording -- confirm before relying
+   on it).
+3. Diagnosis labels: `_load_subject_labels()` scans the columns of
+   `subjects_information_EEG_128channels_resting_lanzhou_2015.xlsx` for a
+   mostly-numeric subject-ID column and a column whose values match
+   `CFG.MDD_LABEL_VALUES` / `CFG.HC_LABEL_VALUES`. It prints which columns
+   it picked -- check that output. If auto-detection fails or mismatches,
+   fill `CFG.MANUAL_LABEL_MAP = {"02010005": 0, "02030007": 1, ...}` by
+   hand instead.
+"""
 import os
 import re
 import sys
@@ -13,21 +54,12 @@ import pandas as pd
 import mne
 import pywt
 import matplotlib.pyplot as plt
-from scipy.io import loadmat
+import scipy.io as sio
 from scipy.stats import skew, kurtosis
 from scipy.signal import hilbert
-try:
-    from tqdm.auto import tqdm
-except ImportError:  # pragma: no cover -- fallback if tqdm isn't installed
-    def tqdm(iterable, **kwargs):
-        total = kwargs.get("total", None)
-        desc = kwargs.get("desc", "")
-        if desc:
-            print(desc)
-        return iterable
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.preprocessing import StandardScaler
-from sklearn.feature_selection import SelectKBest, mutual_info_classif, f_classif
+from sklearn.feature_selection import SelectKBest, mutual_info_classif
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import BaggingClassifier
 from sklearn.pipeline import Pipeline
@@ -36,63 +68,31 @@ from sklearn.metrics import (confusion_matrix, accuracy_score, precision_score,
                               recall_score, roc_auc_score, roc_curve, classification_report,
                               ConfusionMatrixDisplay, fowlkes_mallows_score)
 
+try:
+    from tqdm.auto import tqdm
+    _HAS_TQDM = True
+except ImportError:
+    _HAS_TQDM = False
+
+try:
+    import h5py
+    _HAS_H5PY = True
+except ImportError:
+    _HAS_H5PY = False
+
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-# =============================================================================
-# WHAT CHANGED IN THIS FILE vs. the previous version (leakage fix)
-# =============================================================================
-# The old select_channels_fast() ran the ANOVA F-test channel ranking ONCE,
-# globally, on ALL 53 subjects, BEFORE any outer-CV split existed. Every
-# outer-test fold's held-out subjects therefore contributed their own labels
-# to the channel ranking that then got used to compute that same fold's
-# "held-out" performance -- textbook feature-selection leakage (the docstring
-# even flagged this as a caveat, but it wasn't actually fixed).
-#
-# Fix: channel selection is now refit per OUTER fold, using only that fold's
-# dev/train subjects' bandpower + labels (see select_channels_for_fold()).
-# The outer-test subjects never influence which channels are kept for the
-# fold that scores them. This means:
-#   - Channel selection moved from a one-time pre-processing step (section 1b)
-#     to inside run_nested_cv_for_band()'s outer-fold loop (section 7).
-#   - Wavelet/PLV feature extraction (which depends on which channels were
-#     selected) also moved inside the outer-fold loop, since the channel set
-#     now varies per fold instead of being fixed once for the whole band.
-#   - To avoid re-running MNE filtering/resampling per fold (the actually
-#     expensive I/O step), the band-filtered 128-channel raw signal for every
-#     subject is loaded ONCE per band and cached in memory
-#     (load_band_signal_cache()); each fold just slices + windows the cached
-#     signal for its own selected channels. This is also strictly cheaper
-#     than the old code, which reloaded raw signals separately in
-#     select_channels_fast() and again in build_dataset_for_band().
-#   - Selected channels are printed per fold before that fold's pipeline
-#     (Klein fusion -> SelectKBest -> Logistic Regression, bagged) is fit,
-#     per your request.
-#
-# Everything else -- KleinOps / KleinMultiScaleFusion, the sklearn Pipeline,
-# the nested inner-CV GridSearchCV + BaggingClassifier + Youden's-J threshold
-# logic inside run_one_outer_fold(), metrics, persistence, plotting -- is
-# UNCHANGED from the previous version.
-#
-# Residual (much smaller) leakage note: channel selection is refit per OUTER
-# fold, not per INNER fold. So within a given outer fold, the channel ranking
-# is informed by all dev subjects, including the ones that land in inner-CV
-# validation splits during hyperparameter search. That only affects which
-# hyperparameters GridSearchCV picks, not the outer-test metrics that are
-# actually reported/compared across bands. Fixing that too would mean
-# refitting channel selection inside every inner split as well -- a bigger
-# restructure than a channel-selection fix implies, so it's left as-is here.
-# =============================================================================
-
-USE_BIDS_EDF = False   # flip to True if your MODMA copy is the BIDS .edf release
-
-
+# --------------------------------------------------------------------------- #
+# CONFIG
+# --------------------------------------------------------------------------- #
 @dataclass
 class CONFIG:
     DATA_ROOT: str = "/kaggle/input/datasets/kinnarhalder/modmaa/EEG_128channels_resting_lanzhou_2015"
+    SUBJECT_INFO_XLSX: str = ""   # blank -> auto-find the single .xlsx under DATA_ROOT
     SFREQ_TARGET: int = 128
-    MODMA_NATIVE_SFREQ: int = 250          # MODMA HCGSN acquisition rate
+    SFREQ_ORIG: float = 250.0     # fallback ONLY if no srate/fs field is found in the .mat -- VERIFY
     BANDS: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
         "delta": (0.5, 4.0),
         "theta": (4.0, 8.0),
@@ -104,262 +104,272 @@ class CONFIG:
         "delta",
     ))
     SCALES_SEC: Tuple[int, int, int] = (1, 2, 3)
-    N_CHANNELS: int = 128                                  # raw MODMA channel count (before selection)
-    N_CHANNELS_SELECT: int = 19                             # channels kept after fast selection, see select_channels_for_fold()
+    # 25 EGI HydroCel channels requested for the MODMA run.
+    SELECTED_CHANNELS: Tuple[str, ...] = field(default_factory=lambda: (
+        "E68", "E69", "E70", "E72", "E65", "E95", "E61", "E76", "E86", "E111",
+        "E66", "E81", "E116", "E103", "E97", "E82", "E91", "E83", "E30", "E77",
+        "E59", "E52", "E112", "E127", "E105",
+    ))
+    N_CHANNELS: int = 25
     WAVELET: str = "db4"
     WAVELET_LEVEL: int = 3
-    INCLUDE_PLV: bool = True                               # see runtime note above -- set False to cut ~8k feats/scale
+    INCLUDE_PLV: bool = True
     KLEIN_CURVATURE_GRID: Tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
     KLEIN_SCALE_FACTOR_GRID: Tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
     SATURATION_MARGIN: float = 0.95
-    SELECT_K_GRID: Tuple = (30, 60, 120, 240)              # dropped "all" -- selecting "all" of ~10k feats is expensive and rarely wins
-    N_OUTER_FOLDS: int = 3                                 # revisit if a class has <~10 subjects (see note above)
+    SELECT_K_GRID: Tuple = (30, 60, 120, "all")
+    N_OUTER_FOLDS: int = 5
     N_INNER_FOLDS: int = 3
     N_REPEATS: int = 3
     N_BAGGING_ESTIMATORS: int = 31
     BAGGING_MAX_SAMPLES: float = 0.9
     SEED: int = 42
-    SAVE_DIR: str = "results_modma128"
+    SAVE_DIR: str = "results_modma"
+    # values (case-insensitive) treated as "MDD" / "Healthy control" when
+    # scanning the subject-info spreadsheet -- extend if the file uses
+    # different wording (e.g. "patient" / "depressed" / "case").
+    MDD_LABEL_VALUES: Tuple[str, ...] = ("mdd", "depression", "patient", "case", "1")
+    HC_LABEL_VALUES: Tuple[str, ...] = ("hc", "h", "healthy", "control", "normal", "0")
+    MANUAL_LABEL_MAP: Dict[str, int] = field(default_factory=dict)  # {"02010005": 0, ...}
 
 
 CFG = CONFIG()
 np.random.seed(CFG.SEED)
 
 
-def _fmt_secs(seconds: float) -> str:
-    """Human-readable duration, e.g. '2m 14s' or '48.3s'."""
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    m, s = divmod(int(round(seconds)), 60)
-    h, m = divmod(m, 60)
-    return f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
-
-
 # --------------------------------------------------------------------------- #
-# 1. Data indexing / labeling -- UNCHANGED
+# 0. Diagnostics -- run these by hand once before a full pipeline run
 # --------------------------------------------------------------------------- #
-def _load_label_map_from_xlsx(root: str) -> Optional[Dict[str, int]]:
-    candidates = sorted(glob.glob(os.path.join(root, "*resting*.xlsx"))) or \
-                 sorted(glob.glob(os.path.join(root, "*.xlsx")))
-    if not candidates:
-        print("[WARN] no subjects_information .xlsx found next to the data -- "
-              "falling back to filename-prefix labeling (0201=MDD, else=NC).")
-        return None
-    xlsx_path = candidates[0]
+def inspect_modma_mat_file(path: str) -> None:
+    """Prints every variable name / shape / dtype in one .mat file so you can
+    confirm the EEG-data variable and sample-rate field before trusting the
+    auto-detection in `_load_mat_eeg_array()`. Not called automatically."""
+    print(f"Inspecting {path}")
     try:
-        df = pd.read_excel(xlsx_path)
-    except Exception as exc:
-        print(f"[WARN] could not read {xlsx_path} ({exc}) -- "
-              f"falling back to filename-prefix labeling (0201=MDD, else=NC).")
-        return None
+        mat = sio.loadmat(path)
+        print("  format: MATLAB <= v7.2 (loaded via scipy.io.loadmat)")
+        for k, v in mat.items():
+            if k.startswith("__"):
+                continue
+            v = np.asarray(v)
+            print(f"    {k!r:24s} shape={v.shape} dtype={v.dtype}")
+    except NotImplementedError:
+        if not _HAS_H5PY:
+            print("  format: MATLAB v7.3 (HDF5) -- install h5py to inspect it (`pip install h5py`).")
+            return
+        with h5py.File(path, "r") as f:
+            print("  format: MATLAB v7.3 (loaded via h5py)")
+            def _walk(name, obj):
+                if isinstance(obj, h5py.Dataset):
+                    print(f"    {name!r:24s} shape={obj.shape} dtype={obj.dtype}")
+            f.visititems(_walk)
 
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    id_col = next((c for c in df.columns if any(k in c for k in ("subject", "id", "code"))), None)
-    type_col = next((c for c in df.columns if any(k in c for k in ("type", "group", "label", "diagn"))), None)
-    if id_col is None or type_col is None:
-        print(f"[WARN] {xlsx_path} columns {list(df.columns)} didn't match an "
-              f"expected subject-id / group column -- inspect the sheet manually "
-              f"and adjust id_col/type_col matching above. Falling back to "
-              f"filename-prefix labeling (0201=MDD, else=NC).")
-        return None
+
+def inspect_modma_subject_info(cfg: CONFIG) -> None:
+    """Prints the columns + first few rows of the subject-info spreadsheet so
+    you can confirm/override CFG.MDD_LABEL_VALUES / HC_LABEL_VALUES or supply
+    CFG.MANUAL_LABEL_MAP. Not called automatically."""
+    xlsx_path = cfg.SUBJECT_INFO_XLSX or next(iter(glob.glob(os.path.join(cfg.DATA_ROOT, "*.xlsx"))), None)
+    if not xlsx_path:
+        print(f"No .xlsx found under {cfg.DATA_ROOT}")
+        return
+    df = pd.read_excel(xlsx_path)
+    print(f"Subject-info file: {xlsx_path}")
+    print(f"Columns: {list(df.columns)}")
+    print(df.head(10).to_string())
+
+
+# --------------------------------------------------------------------------- #
+# 1. Data indexing / labeling (MODMA: .mat files + subject-info spreadsheet)
+# --------------------------------------------------------------------------- #
+def _normalize_id(x) -> str:
+    return re.sub(r"\D", "", str(x))
+
+
+def _load_subject_labels(xlsx_path: str, cfg: CONFIG) -> Dict[str, int]:
+    """Auto-detects the subject-ID column and the diagnosis column in the
+    subjects-information spreadsheet, returns {normalized_subject_id: label}
+    with label 1=MDD, 0=Healthy. Prints its column choices -- verify these
+    against inspect_modma_subject_info() output."""
+    df = pd.read_excel(xlsx_path)
+    print(f"[subject-info] columns in {os.path.basename(xlsx_path)}: {list(df.columns)}")
+
+    id_col, label_col = None, None
+    mdd_vals = {v.lower() for v in cfg.MDD_LABEL_VALUES}
+    hc_vals = {v.lower() for v in cfg.HC_LABEL_VALUES}
+    for col in df.columns:
+        vals = df[col].dropna().astype(str)
+        if len(vals) == 0:
+            continue
+        if id_col is None and vals.str.match(r"^\d{4,8}$").mean() > 0.7:
+            id_col = col
+        lower_vals = vals.str.strip().str.lower()
+        hits = lower_vals.isin(mdd_vals | hc_vals)
+        if label_col is None and hits.mean() > 0.7:
+            label_col = col
+
+    if id_col is None or label_col is None:
+        raise ValueError(
+            f"Could not auto-detect subject-id / diagnosis columns in {xlsx_path} "
+            f"(id_col={id_col}, label_col={label_col}). Run inspect_modma_subject_info(CFG), "
+            f"then either widen CFG.MDD_LABEL_VALUES/HC_LABEL_VALUES, or skip auto-detection "
+            f"entirely by filling CFG.MANUAL_LABEL_MAP by hand."
+        )
+    print(f"[subject-info] using id_col={id_col!r}, label_col={label_col!r}")
 
     label_map = {}
     for _, row in df.iterrows():
-        digits = re.sub(r"\D", "", str(row[id_col]))
-        if not digits:
+        if pd.isna(row[id_col]) or pd.isna(row[label_col]):
             continue
-        type_val = str(row[type_col]).strip().upper()
-        label = 1 if any(k in type_val for k in ("MDD", "DEPRES", "PATIENT")) else 0
-        label_map[digits] = label
-    if not label_map:
-        print(f"[WARN] parsed 0 usable rows from {xlsx_path} -- "
-              f"falling back to filename-prefix labeling (0201=MDD, else=NC).")
-        return None
-    print(f"Loaded {len(label_map)} subject labels from {os.path.basename(xlsx_path)} "
-          f"(id_col='{id_col}', type_col='{type_col}')")
+        sid = _normalize_id(row[id_col])
+        lab = str(row[label_col]).strip().lower()
+        if not sid:
+            continue
+        if lab in mdd_vals:
+            label_map[sid] = 1
+        elif lab in hc_vals:
+            label_map[sid] = 0
     return label_map
 
 
-def index_dataset(root: str) -> List[Dict]:
-    """Scan DATA_ROOT and return [{path, subject_id, label}, ...]."""
-    pattern = "*.edf" if USE_BIDS_EDF else "*.mat"
-    label_map = None if USE_BIDS_EDF else _load_label_map_from_xlsx(root)
+def index_dataset_modma(cfg: CONFIG) -> List[Dict]:
+    """Scan DATA_ROOT for .mat recordings and match each to an MDD/Healthy
+    label via the subject-info spreadsheet (or CFG.MANUAL_LABEL_MAP)."""
+    label_map = {}
+    if not cfg.MANUAL_LABEL_MAP or True:  # still build the spreadsheet map as a fallback source
+        xlsx_path = cfg.SUBJECT_INFO_XLSX
+        if not xlsx_path:
+            candidates = glob.glob(os.path.join(cfg.DATA_ROOT, "*.xlsx"))
+            if candidates:
+                xlsx_path = candidates[0]
+        if xlsx_path:
+            try:
+                label_map = _load_subject_labels(xlsx_path, cfg)
+            except ValueError as e:
+                if not cfg.MANUAL_LABEL_MAP:
+                    raise
+                print(f"[WARN] {e}\nFalling back entirely to CFG.MANUAL_LABEL_MAP.")
 
-    records = []
-    n_fallback = 0
-    for path in sorted(glob.glob(os.path.join(root, pattern))):
+    records, unmatched = [], []
+    for path in sorted(glob.glob(os.path.join(cfg.DATA_ROOT, "*.mat"))):
         fname = os.path.basename(path)
-        m = re.match(r"(\d{8})", fname)
+        m = re.match(r"^(\d{6,8})", fname)
         if not m:
             continue
-        subject_id = m.group(1)
-        prefix = subject_id[:4]
+        file_id = m.group(1)
+        norm_id = _normalize_id(file_id)
 
-        if label_map is not None and subject_id in label_map:
-            label = label_map[subject_id]
+        if file_id in cfg.MANUAL_LABEL_MAP:
+            label = cfg.MANUAL_LABEL_MAP[file_id]
+        elif norm_id in label_map:
+            label = label_map[norm_id]
         else:
-            n_fallback += 1
-            label = 1 if prefix == "0201" else 0   # 1 = MDD, 0 = NC/healthy
+            # fallback: suffix match, in case the spreadsheet ids are a
+            # different length/padding than the filename ids
+            match = next((v for k, v in label_map.items()
+                          if k and (k.endswith(norm_id) or norm_id.endswith(k))), None)
+            if match is None:
+                unmatched.append(fname)
+                continue
+            label = match
 
-        records.append({"path": path, "subject_id": subject_id, "label": label})
+        records.append({"path": path, "subject_id": file_id, "label": label})
 
+    if unmatched:
+        preview = unmatched[:10]
+        print(f"[WARN] {len(unmatched)} .mat file(s) had no matching label and were skipped: "
+              f"{preview}{' ...' if len(unmatched) > 10 else ''}")
     if not records:
         raise RuntimeError(
-            f"No {pattern} files matched under {root} (looked for an 8-digit "
-            f"subject code at the start of each filename)."
+            "No MODMA .mat files could be matched to a diagnosis label. Run "
+            "inspect_modma_subject_info(CFG) and check CFG.SUBJECT_INFO_XLSX / "
+            "MDD_LABEL_VALUES / HC_LABEL_VALUES, or fill CFG.MANUAL_LABEL_MAP."
         )
-    if n_fallback:
-        print(f"[WARN] {n_fallback}/{len(records)} subjects labeled via filename-prefix "
-              f"fallback rather than the xlsx metadata -- double-check these.")
-    n_mdd = sum(r["label"] for r in records)
-    prefixes_seen = sorted(set(r["subject_id"][:4] for r in records))
-    print(f"Indexed {len(records)} MODMA recordings: {n_mdd} MDD, {len(records) - n_mdd} NC "
-          f"(prefixes seen: {prefixes_seen})")
+    n_mdd = sum(r["label"] == 1 for r in records)
+    print(f"Indexed {len(records)} MODMA recordings -> {n_mdd} MDD / {len(records) - n_mdd} Healthy")
     return records
 
 
 # --------------------------------------------------------------------------- #
-# 1b. Fast, LEAKAGE-FREE channel selection (ANOVA F-test on per-channel
-#     log-bandpower), refit per outer CV fold.
+# 2. Signal loading + multi-scale windowing (MODMA: .mat, 25 selected channels)
 # --------------------------------------------------------------------------- #
-# Two-step split, matching the original method's cost profile:
-#   (a) load_band_signal_cache() loads + band-filters the 128-channel signal
-#       for every subject ONCE per band (this is the expensive MNE step) and
-#       compute_bandpower_matrix() turns that into one cheap (n_subj, 128)
-#       log-variance bandpower matrix, shared across all outer folds/repeats.
-#   (b) select_channels_for_fold() runs the actual ANOVA F-test / ranking,
-#       but ONLY on the bandpower rows belonging to that fold's dev (train)
-#       subjects. Outer-test subjects' bandpower/labels never enter the
-#       ranking that selects the channels used to score them -- this is the
-#       fix for the leakage in the original global select_channels_fast().
-# --------------------------------------------------------------------------- #
-def load_band_signal_cache(records: List[Dict], cfg: CONFIG, band: Tuple[float, float]) -> Dict[str, np.ndarray]:
-    """Load + band-filter the raw (128, n_samples) signal for every record
-    ONCE for this band, keyed by file path. Reused for both the bandpower
-    matrix (channel ranking) and the wavelet/PLV feature extraction, so each
-    subject's MNE filtering/resampling only runs once per band instead of
-    twice (as it did in the previous global-selection version)."""
-    cache = {}
-    t0 = time.time()
-    pbar = tqdm(records, desc="Loading+filtering raw signals", unit="subj")
-    for rec in pbar:
-        try:
-            cache[rec["path"]] = load_raw_band(rec["path"], cfg, band=band)
-        except Exception as exc:
-            print(f"[WARN] could not load {rec['path']}: {exc}")
-        pbar.set_postfix_str(rec["subject_id"])
-    print(f"[TIMING] signal cache load: {_fmt_secs(time.time() - t0)} "
-          f"for {len(cache)}/{len(records)} subjects")
-    return cache
+CHANNEL_ORDER_128 = [f"E{i}" for i in range(1, 129)]
 
 
-def compute_bandpower_matrix(records: List[Dict], signal_cache: Dict[str, np.ndarray], cfg: CONFIG
-                              ) -> Tuple[List[Dict], np.ndarray, np.ndarray, np.ndarray]:
-    """(n_subjects, N_CHANNELS) log-variance bandpower proxy per channel, plus
-    the matching (kept_records, y, groups) -- subjects whose signal failed to
-    load are dropped here and everywhere downstream for this band."""
-    kept_records, X_bp = [], []
-    for rec in records:
-        sig = signal_cache.get(rec["path"])
-        if sig is None:
-            continue
-        X_bp.append(np.log1p(np.var(sig, axis=1)))
-        kept_records.append(rec)
-    X_bp = np.stack(X_bp)
-    y = np.array([r["label"] for r in kept_records])
-    groups = np.array([r["subject_id"] for r in kept_records])
-    return kept_records, X_bp, y, groups
+def _egi_channel_order(n_channels_in_file: int) -> List[str]:
+    """Standard GSN-HydroCel-129 net channel numbering. ASSUMPTION -- verify
+    with inspect_modma_mat_file() that the .mat channel axis actually follows
+    E1..E128 (+Cz) order; if not, fix this function."""
+    if n_channels_in_file == 128:
+        return CHANNEL_ORDER_128
+    elif n_channels_in_file == 129:
+        return CHANNEL_ORDER_128 + ["Cz"]
+    raise ValueError(
+        f"Unexpected channel count {n_channels_in_file} -- expected 128 (E1..E128) or "
+        f"129 (E1..E128 + Cz). Run inspect_modma_mat_file() on this file and adjust "
+        f"_egi_channel_order() if this dataset uses a non-standard layout."
+    )
 
 
-def select_channels_for_fold(X_bp_train: np.ndarray, y_train: np.ndarray, cfg: CONFIG,
-                              band: Tuple[float, float], n_select: int, fold_label: str = "") -> np.ndarray:
-    """ANOVA F-test channel ranking, fit ONLY on this outer fold's dev/train
-    subjects (see the module-level note above for why)."""
-    ch_names = [f"E{i + 1}" for i in range(cfg.N_CHANNELS)]
-    f_scores, p_values = f_classif(X_bp_train, y_train)
-    f_scores = np.nan_to_num(f_scores, nan=0.0)
-    ranked = np.argsort(f_scores)[::-1]
-    selected = np.sort(ranked[:n_select])   # ascending order for consistent downstream indexing
+def _load_mat_eeg_array(path: str, cfg: CONFIG) -> Tuple[np.ndarray, float]:
+    """Load (n_channels_total, n_samples) + sampling rate from one MODMA .mat
+    file. Auto-detects the data variable as the first 2D array with a 128 or
+    129 dimension, and the sample rate from a srate/fs/sfreq/sampling_rate/
+    samplerate field if present (else cfg.SFREQ_ORIG)."""
+    is_h5 = False
+    try:
+        mat = sio.loadmat(path)
+    except NotImplementedError:
+        if not _HAS_H5PY:
+            raise RuntimeError(f"{path} is MATLAB v7.3 (HDF5) format -- `pip install h5py` to read it.")
+        mat = h5py.File(path, "r")
+        is_h5 = True
 
-    print(f"\nChannel selection {fold_label}(ANOVA F-test on log-bandpower, "
-          f"band={band[0]}-{band[1]} Hz, n_select={n_select}, "
-          f"fit on {len(y_train)} dev-fold subjects only):")
-    for rank, idx in enumerate(ranked[:n_select], start=1):
-        print(f"  {rank:2d}. {ch_names[idx]:>5s}  F={f_scores[idx]:8.3f}  p={p_values[idx]:.2e}")
-    print(f"Selected channels (ascending): {[ch_names[i] for i in selected]}\n")
-    return selected
+    def _to_np(v):
+        return np.array(v) if is_h5 else np.asarray(v)
 
+    keys = [k for k in mat.keys() if not k.startswith("__")]
+    data_arr = None
+    for k in keys:
+        arr = _to_np(mat[k])
+        if arr.ndim == 2 and (128 in arr.shape or 129 in arr.shape):
+            data_arr = arr
+            break
+    if data_arr is None:
+        shapes = {k: _to_np(mat[k]).shape for k in keys}
+        if is_h5:
+            mat.close()
+        raise ValueError(
+            f"No 128/129-channel 2D array found in {path}. Keys/shapes: {shapes}. "
+            f"Run inspect_modma_mat_file({path!r}) and adjust _load_mat_eeg_array()."
+        )
+    if data_arr.shape[0] not in (128, 129):
+        data_arr = data_arr.T  # ensure channels-first
 
-# --------------------------------------------------------------------------- #
-# 2. Signal loading + multi-scale windowing (MODMA .mat -> MNE RawArray)
-#    -- UNCHANGED
-# --------------------------------------------------------------------------- #
-def _load_modma_mat_matrix(path: str, cfg: CONFIG) -> np.ndarray:
-    """Load one MODMA resting-state .mat file and return a (128, n_samples)
-    float64 array in volts, dropping the trailing Cz reference channel.
+    sfreq = None
+    for k in keys:
+        if k.lower() in ("srate", "fs", "sfreq", "sampling_rate", "samplerate"):
+            sfreq = float(np.asarray(_to_np(mat[k])).squeeze())
+            break
+    if sfreq is None:
+        sfreq = cfg.SFREQ_ORIG  # fallback -- verify against inspect_modma_mat_file()
 
-    MODMA's own documentation says EEGLAB loads a MATLAB struct where
-    `EEG.data` is (129, n_samples): rows E1..E128 then Cz. Some re-uploads
-    (including third-party Kaggle mirrors) instead store the raw matrix
-    directly under a plain variable name -- sometimes the subject code
-    itself -- rather than nested in an "EEG" struct. This checks the
-    documented "EEG.data" path first, then falls back to scanning every
-    top-level variable in the .mat for one shaped like a 128/129-channel
-    recording, and raises with the actual keys/shapes found if nothing
-    matches so you can tell me what's really in there.
-    """
-    mat = loadmat(path, squeeze_me=True, struct_as_record=False)
-    data = None
-
-    if "EEG" in mat:
-        try:
-            data = np.asarray(mat["EEG"].data)
-        except AttributeError:
-            data = None
-
-    if data is None:
-        best = None
-        for key, val in mat.items():
-            if key.startswith("__"):
-                continue
-            arr = np.asarray(val)
-            if arr.ndim == 2 and (128 in arr.shape or 129 in arr.shape):
-                best = arr
-                break
-        if best is None:
-            shapes = {k: np.asarray(v).shape for k, v in mat.items() if not k.startswith("__")}
-            raise ValueError(
-                f"couldn't find a 128/129-channel matrix in {path}. "
-                f"Top-level variables and shapes: {shapes}"
-            )
-        data = best
-
-    if data.ndim != 2:
-        raise ValueError(f"unexpected data shape {data.shape} in {path}")
-    if data.shape[0] not in (128, 129) and data.shape[1] in (128, 129):
-        data = data.T   # MNE/EEG convention is (channels, samples); transpose if flipped
-    if data.shape[0] == 129:
-        data = data[:128, :]
-    elif data.shape[0] != 128:
-        raise ValueError(f"expected 128 or 129 channels, got shape {data.shape} in {path}")
-    # MODMA amplitudes are typically in microvolts on export; MNE expects volts.
-    return data.astype(np.float64) * 1e-6
+    if is_h5:
+        mat.close()
+    return data_arr.astype(np.float64), sfreq
 
 
-def load_raw_band(path: str, cfg: CONFIG, band: Tuple[float, float]) -> np.ndarray:
-    if USE_BIDS_EDF:
-        raw = mne.io.read_raw_edf(path, preload=True, verbose="ERROR")
-        raw.pick_types(eeg=True)
-    else:
-        data = _load_modma_mat_matrix(path, cfg)
-        ch_names = [f"E{i+1}" for i in range(cfg.N_CHANNELS)]
-        info = mne.create_info(ch_names=ch_names, sfreq=cfg.MODMA_NATIVE_SFREQ, ch_types="eeg")
-        raw = mne.io.RawArray(data, info, verbose="ERROR")
+def load_mat_band(path: str, cfg: CONFIG, band: Tuple[float, float]) -> np.ndarray:
+    data_full, sfreq_orig = _load_mat_eeg_array(path, cfg)
+    ch_order = _egi_channel_order(data_full.shape[0])
+    try:
+        sel_idx = [ch_order.index(ch) for ch in cfg.SELECTED_CHANNELS]
+    except ValueError as e:
+        raise ValueError(f"selected channel not found in detected {len(ch_order)}-ch EGI layout: {e}")
+    data_sel = data_full[sel_idx, :]
 
-    if len(raw.ch_names) < cfg.N_CHANNELS:
-        raise ValueError(f"only {len(raw.ch_names)} EEG channels, need {cfg.N_CHANNELS}")
-    if len(raw.ch_names) > cfg.N_CHANNELS:
-        raw.pick(raw.ch_names[: cfg.N_CHANNELS])
+    info = mne.create_info(ch_names=list(cfg.SELECTED_CHANNELS), sfreq=sfreq_orig, ch_types="eeg")
+    raw = mne.io.RawArray(data_sel, info, verbose="ERROR")
     raw.filter(band[0], band[1], verbose="ERROR")
     if raw.info["sfreq"] != cfg.SFREQ_TARGET:
         raw.resample(cfg.SFREQ_TARGET, verbose="ERROR")
@@ -374,7 +384,7 @@ def partition_signal(signal: np.ndarray, sfreq: int, window_sec: int) -> List[np
 
 # --------------------------------------------------------------------------- #
 # 3. Feature extraction: wavelet sub-band statistics + Hjorth parameters
-#    -- UNCHANGED
+#    (unchanged from the EDF pipeline)
 # --------------------------------------------------------------------------- #
 def hjorth_parameters(x: np.ndarray) -> Tuple[float, float, float]:
     eps = 1e-12
@@ -412,7 +422,7 @@ def wavelet_window_features(window: np.ndarray, wavelet: str, level: int) -> np.
 
 
 # --------------------------------------------------------------------------- #
-# 3b. PLV (Phase Locking Value) connectivity features -- UNCHANGED
+# 3b. PLV (Phase Locking Value) connectivity features (unchanged)
 # --------------------------------------------------------------------------- #
 def instantaneous_phase(window: np.ndarray) -> np.ndarray:
     analytic = hilbert(window, axis=-1)
@@ -452,25 +462,15 @@ def scale_feature_vector(signal: np.ndarray, sfreq: int, window_sec: int, cfg: C
     return feats.mean(axis=0)
 
 
-def build_dataset_from_cache(records_subset: List[Dict], signal_cache: Dict[str, np.ndarray],
-                              cfg: CONFIG, selected_channels: np.ndarray, desc: str = "Feature extraction",
-                              show_bar: bool = False
-                              ) -> Tuple[Dict[int, np.ndarray], np.ndarray, np.ndarray]:
-    """Wavelet/Hjorth + PLV feature extraction for a subset of records
-    (e.g. one outer fold's dev or test subjects), using the already-loaded
-    cached band-filtered signal, sliced to `selected_channels`. Replaces the
-    disk-loading half of the old build_dataset_for_band(): the raw signal is
-    sliced/windowed here rather than reloaded from disk."""
+def build_dataset_for_band(records: List[Dict], cfg: CONFIG, band: Tuple[float, float]
+                            ) -> Tuple[Dict[int, np.ndarray], np.ndarray, np.ndarray]:
     X_by_scale = {s: [] for s in cfg.SCALES_SEC}
     y, groups = [], []
-    iterator = tqdm(records_subset, desc=desc, unit="subj", leave=False) if show_bar else records_subset
+    iterator = tqdm(records, desc="Extracting features", unit="subj") if _HAS_TQDM else records
     for rec in iterator:
-        sig = signal_cache.get(rec["path"])
-        if sig is None:
-            continue
-        sig = sig[selected_channels, :]
         try:
-            per_scale = {s: scale_feature_vector(sig, cfg.SFREQ_TARGET, s, cfg)
+            signal = load_mat_band(rec["path"], cfg, band=band)
+            per_scale = {s: scale_feature_vector(signal, cfg.SFREQ_TARGET, s, cfg)
                          for s in cfg.SCALES_SEC}
         except Exception as exc:
             print(f"[WARN] skipping {rec['path']}: {exc}")
@@ -485,7 +485,7 @@ def build_dataset_from_cache(records_subset: List[Dict], signal_cache: Dict[str,
 
 
 # --------------------------------------------------------------------------- #
-# 4. Klein (Beltrami-Klein) hyperbolic model operations -- UNCHANGED
+# 4. Klein (Beltrami-Klein) hyperbolic model operations (unchanged)
 # --------------------------------------------------------------------------- #
 class KleinOps:
     """Beltrami-Klein disk operations for curvature -c (c > 0)."""
@@ -572,7 +572,7 @@ class KleinMultiScaleFusion(BaseEstimator, TransformerMixin):
 
 
 # --------------------------------------------------------------------------- #
-# 5. Pipeline construction (Logistic Regression only) -- UNCHANGED
+# 5. Pipeline construction (Logistic Regression only, unchanged)
 # --------------------------------------------------------------------------- #
 def param_grid(cfg: CONFIG) -> Dict:
     return {
@@ -594,7 +594,7 @@ def make_pipeline(n_scales: int, cfg: CONFIG) -> Pipeline:
 
 
 # --------------------------------------------------------------------------- #
-# 6. Metrics -- UNCHANGED
+# 6. Metrics (unchanged)
 # --------------------------------------------------------------------------- #
 METRIC_KEYS = ["accuracy", "precision", "recall_sensitivity", "specificity", "roc_auc", "fowlkes_mallows"]
 
@@ -642,21 +642,17 @@ def make_bagging_classifier(base_pipe: Pipeline, cfg: CONFIG, seed: int) -> Bagg
 
 
 # --------------------------------------------------------------------------- #
-# 7. Nested (outer + inner) cross-validation for one band
-#    -- outer loop now also does per-fold channel selection (see section 1b)
+# 7. Nested (outer + inner) cross-validation for one band (unchanged)
 # --------------------------------------------------------------------------- #
 def run_one_outer_fold(band_name: str, X_dev: np.ndarray, y_dev: np.ndarray, groups_dev: np.ndarray,
                         X_test: np.ndarray, y_test: np.ndarray,
                         cfg: CONFIG, seed: int, fold_label: str):
-    t_fold0 = time.time()
     inner_cv = StratifiedGroupKFold(n_splits=cfg.N_INNER_FOLDS, shuffle=True, random_state=seed)
     grid = param_grid(cfg)
 
-    t0 = time.time()
     pipe = make_pipeline(n_scales=len(cfg.SCALES_SEC), cfg=cfg)
     search = GridSearchCV(pipe, grid, cv=inner_cv, scoring="roc_auc", n_jobs=-1, refit=False)
     search.fit(X_dev, y_dev, groups=groups_dev)
-    t_grid = time.time() - t0
 
     fixed_pipe = make_pipeline(n_scales=len(cfg.SCALES_SEC), cfg=cfg)
     fixed_pipe.set_params(**search.best_params_)
@@ -667,85 +663,44 @@ def run_one_outer_fold(band_name: str, X_dev: np.ndarray, y_dev: np.ndarray, gro
 
     bagged = make_bagging_classifier(fixed_pipe, cfg, seed)
 
-    t0 = time.time()
     oof_proba = cross_val_predict(bagged, X_dev, y_dev, groups=groups_dev,
                                    cv=inner_cv, method="predict_proba", n_jobs=-1)[:, 1]
     best_threshold = find_best_threshold(y_dev, oof_proba)
-    t_bag_cv = time.time() - t0
 
-    t0 = time.time()
     bagged.fit(X_dev, y_dev)
     y_score = bagged.predict_proba(X_test)[:, 1]
-    t_bag_fit = time.time() - t0
     y_pred = (y_score >= best_threshold).astype(int)
 
     fold_metrics = compute_metrics(y_test, y_pred, y_score)
     fold_metrics["decision_threshold"] = best_threshold
     fold_metrics["saturation_rate"] = saturation_rate
-    t_fold_total = time.time() - t_fold0
-    fold_metrics["_fold_seconds"] = t_fold_total
     print(f"[{band_name}] {fold_label} | best_params={search.best_params_} | "
           f"threshold={best_threshold:.3f} | acc={fold_metrics['accuracy']:.3f} | "
           f"sens={fold_metrics['recall_sensitivity']:.3f} | spec={fold_metrics['specificity']:.3f} | "
           f"auc={fold_metrics['roc_auc']:.3f} | fm={fold_metrics['fowlkes_mallows']:.3f} | "
           f"klein_saturation={saturation_rate:.3f}")
-    print(f"    [TIMING] fold total={_fmt_secs(t_fold_total)}  "
-          f"(grid_search={_fmt_secs(t_grid)}, bagged_oof_cv={_fmt_secs(t_bag_cv)}, "
-          f"bagged_final_fit={_fmt_secs(t_bag_fit)})")
     return fold_metrics, y_test, y_pred, y_score
 
 
-def run_nested_cv_for_band(band_name: str, band_range: Tuple[float, float],
-                            records: List[Dict], signal_cache: Dict[str, np.ndarray],
-                            X_bp: np.ndarray, y_all: np.ndarray, groups_all: np.ndarray,
+def run_nested_cv_for_band(band_name: str, X_full: np.ndarray, y: np.ndarray, groups: np.ndarray,
                             cfg: CONFIG):
-    """records/X_bp/y_all/groups_all must all be aligned (same order, same
-    length) -- i.e. the `kept_records` output of compute_bandpower_matrix()
-    and its accompanying y/groups, not the raw index_dataset() output."""
     all_fold_metrics = []
     pooled_y_true, pooled_y_pred, pooled_y_score = [], [], []
-    channels_per_fold = []
 
     total_folds = cfg.N_REPEATS * cfg.N_OUTER_FOLDS
-    fold_bar = tqdm(total=total_folds, desc=f"[{band_name}] outer folds", unit="fold")
-    band_t0 = time.time()
+    pbar = tqdm(total=total_folds, desc=f"{band_name} nested CV", unit="fold") if _HAS_TQDM else None
+    t0 = time.time()
 
     for repeat in range(cfg.N_REPEATS):
         seed = cfg.SEED + repeat
         outer_cv = StratifiedGroupKFold(n_splits=cfg.N_OUTER_FOLDS, shuffle=True, random_state=seed)
 
-        for fold_idx, (train_idx, test_idx) in enumerate(outer_cv.split(X_bp, y_all, groups_all), start=1):
-            fold_num = (repeat * cfg.N_OUTER_FOLDS) + fold_idx
+        for fold_idx, (train_idx, test_idx) in enumerate(outer_cv.split(X_full, y, groups), start=1):
+            X_dev, X_test = X_full[train_idx], X_full[test_idx]
+            y_dev, y_test = y[train_idx], y[test_idx]
+            groups_dev = groups[train_idx]
+
             fold_label = f"Repeat {repeat + 1}/{cfg.N_REPEATS} | Fold {fold_idx}/{cfg.N_OUTER_FOLDS}"
-
-            # --- leakage-free channel selection: fit ONLY on this fold's dev subjects ---
-            t0 = time.time()
-            selected_channels = select_channels_for_fold(
-                X_bp[train_idx], y_all[train_idx], cfg, band_range, cfg.N_CHANNELS_SELECT,
-                fold_label=f"[{band_name}] {fold_label} "
-            )
-            t_select = time.time() - t0
-            channels_per_fold.append(selected_channels)
-
-            dev_records = [records[i] for i in train_idx]
-            test_records = [records[i] for i in test_idx]
-
-            # --- feature extraction for dev/test using only the fold's selected channels ---
-            t0 = time.time()
-            X_dev_by_scale, y_dev, groups_dev = build_dataset_from_cache(
-                dev_records, signal_cache, cfg, selected_channels,
-                desc=f"  fold {fold_num}/{total_folds} dev feats", show_bar=True)
-            X_test_by_scale, y_test, _ = build_dataset_from_cache(
-                test_records, signal_cache, cfg, selected_channels,
-                desc=f"  fold {fold_num}/{total_folds} test feats", show_bar=True)
-            t_feat = time.time() - t0
-
-            X_dev = np.concatenate([X_dev_by_scale[s] for s in cfg.SCALES_SEC], axis=1)
-            X_test = np.concatenate([X_test_by_scale[s] for s in cfg.SCALES_SEC], axis=1)
-            print(f"    [TIMING] fold {fold_num}/{total_folds} pre-model: "
-                  f"channel_select={_fmt_secs(t_select)}, feature_extraction={_fmt_secs(t_feat)}")
-
-            # --- Klein fusion -> SelectKBest -> Logistic Regression (bagged), UNCHANGED ---
             fold_metrics, y_t, y_p, y_s = run_one_outer_fold(
                 band_name, X_dev, y_dev, groups_dev, X_test, y_test, cfg, seed, fold_label
             )
@@ -754,17 +709,22 @@ def run_nested_cv_for_band(band_name: str, band_range: Tuple[float, float],
             pooled_y_pred.extend(y_p.tolist())
             pooled_y_score.extend(y_s.tolist())
 
-            elapsed = time.time() - band_t0
-            avg_per_fold = elapsed / fold_num
-            remaining = avg_per_fold * (total_folds - fold_num)
-            fold_bar.set_postfix_str(
-                f"elapsed={_fmt_secs(elapsed)} | avg/fold={_fmt_secs(avg_per_fold)} | "
-                f"ETA={_fmt_secs(remaining)}"
-            )
-            fold_bar.update(1)
+            if pbar is not None:
+                elapsed = time.time() - t0
+                done = len(all_fold_metrics)
+                eta = elapsed / done * (total_folds - done) if done else 0.0
+                pbar.set_postfix(elapsed=f"{elapsed/60:.1f}m", eta=f"{eta/60:.1f}m")
+                pbar.update(1)
+            else:
+                elapsed = time.time() - t0
+                done = len(all_fold_metrics)
+                eta = elapsed / done * (total_folds - done) if done else 0.0
+                pct = 100.0 * done / total_folds
+                print(f"[{band_name}] completion: {done}/{total_folds} ({pct:.1f}%) | "
+                      f"elapsed={elapsed/60:.1f}m | eta={eta/60:.1f}m")
 
-    fold_bar.close()
-    print(f"[TIMING] {band_name} band total ({total_folds} outer folds): {_fmt_secs(time.time() - band_t0)}")
+    if pbar is not None:
+        pbar.close()
 
     pooled_y_true = np.array(pooled_y_true)
     pooled_y_pred = np.array(pooled_y_pred)
@@ -780,20 +740,11 @@ def run_nested_cv_for_band(band_name: str, band_range: Tuple[float, float],
     summary["saturation_rate_mean"] = float(np.mean(sat_vals))
     summary["saturation_rate_std"] = float(np.std(sat_vals))
 
-    ch_names = [f"E{i + 1}" for i in range(cfg.N_CHANNELS)]
-    channel_counts = {}
-    for sel in channels_per_fold:
-        for idx in sel:
-            channel_counts[ch_names[idx]] = channel_counts.get(ch_names[idx], 0) + 1
-    summary["channel_selection_frequency"] = dict(
-        sorted(channel_counts.items(), key=lambda kv: kv[1], reverse=True)
-    )
-
     return pooled, summary, all_fold_metrics, (pooled_y_true, pooled_y_pred, pooled_y_score)
 
 
 # --------------------------------------------------------------------------- #
-# 8. Persistence -- UNCHANGED
+# 8. Persistence (unchanged)
 # --------------------------------------------------------------------------- #
 def _band_result_dir(cfg: CONFIG, band_name: str) -> str:
     return os.path.join(cfg.SAVE_DIR, band_name.lower())
@@ -828,7 +779,7 @@ def load_all_saved_band_results(cfg: CONFIG) -> Tuple[Dict[str, Dict], Dict[str,
 
 
 # --------------------------------------------------------------------------- #
-# 9. Cross-band comparison table -- UNCHANGED
+# 9. Cross-band comparison table (unchanged)
 # --------------------------------------------------------------------------- #
 def summary_to_row(band_name: str, summary: Dict) -> Dict:
     row = {"Band": band_name}
@@ -846,14 +797,14 @@ def build_comparison_table(all_summaries: Dict[str, Dict]) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
-# 10. Inline-only plots -- UNCHANGED
+# 10. Inline-only plots (unchanged)
 # --------------------------------------------------------------------------- #
 def show_confusion_matrix(band_name: str, y_true: np.ndarray, y_pred: np.ndarray):
     fig, ax = plt.subplots(figsize=(4, 4))
     ConfusionMatrixDisplay.from_predictions(
         y_true, y_pred, display_labels=["Healthy", "MDD"], cmap="Blues", ax=ax
     )
-    ax.set_title(f"{band_name} — pooled outer-fold predictions (Logistic Regression, MODMA-128)")
+    ax.set_title(f"{band_name} — pooled outer-fold predictions (Logistic Regression)")
     plt.tight_layout()
     plt.show()
 
@@ -867,16 +818,14 @@ def show_roc_overlay(pooled_scores_by_band: Dict[str, Tuple[np.ndarray, np.ndarr
     ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Chance")
     ax.set_xlabel("False Positive Rate")
     ax.set_ylabel("True Positive Rate")
-    ax.set_title("Pooled outer-fold ROC curves — band comparison (MODMA-128, Logistic Regression)")
+    ax.set_title("Pooled outer-fold ROC curves — band comparison (Logistic Regression)")
     ax.legend(loc="lower right", fontsize=8)
     plt.tight_layout()
     plt.show()
 
 
 # --------------------------------------------------------------------------- #
-# 11. Main -- band loop now: load+cache raw signal once, compute bandpower
-#     matrix once, then hand both to run_nested_cv_for_band() which does
-#     per-outer-fold channel selection + feature extraction internally.
+# 11. Main
 # --------------------------------------------------------------------------- #
 def _resolve_bands_to_run(cfg: CONFIG) -> List[str]:
     all_band_keys = list(cfg.BANDS.keys())
@@ -901,37 +850,36 @@ def _resolve_bands_to_run(cfg: CONFIG) -> List[str]:
 
 
 def main():
-    records = index_dataset(CFG.DATA_ROOT)
-    print(f"Indexed {len(records)} recordings across "
-          f"{len(set(r['subject_id'] for r in records))} subjects")
+    print("=" * 100)
+    print("MODMA run -- verify assumptions before trusting results:")
+    print("  1. .mat channel order (E1..E128[+Cz])  -> inspect_modma_mat_file(sample_path)")
+    print("  2. sampling rate (falls back to CFG.SFREQ_ORIG if not found in the .mat)")
+    print("  3. subject-info label columns           -> inspect_modma_subject_info(CFG)")
+    print("=" * 100 + "\n")
+
+    records = index_dataset_modma(CFG)
 
     bands_to_run = _resolve_bands_to_run(CFG)
     print(f"\nBands to run THIS execution: {bands_to_run}")
+    print(f"Channels ({CFG.N_CHANNELS}): {list(CFG.SELECTED_CHANNELS)}")
     print(f"Classifier: Logistic Regression only")
-    print(f"Channels: {CFG.N_CHANNELS} raw -> {CFG.N_CHANNELS_SELECT} selected per outer fold "
-          f"(fast ANOVA F-test on bandpower, refit per fold to avoid leakage)")
     print(f"Running {CFG.N_REPEATS}x nested CV per band: "
           f"{CFG.N_OUTER_FOLDS} outer folds x {CFG.N_INNER_FOLDS} inner folds "
           f"= {CFG.N_REPEATS * CFG.N_OUTER_FOLDS} outer evaluations per band\n")
 
-    run_t0 = time.time()
-    band_bar = tqdm(bands_to_run, desc="Bands", unit="band")
-    for band_key in band_bar:
+    for band_key in bands_to_run:
         band_range = CFG.BANDS[band_key]
         band_name = band_key.capitalize()
-        band_bar.set_postfix_str(band_name)
 
         print(f"\n{'=' * 20} {band_name} ({band_range[0]}-{band_range[1]} Hz) {'=' * 20}")
-
-        signal_cache = load_band_signal_cache(records, CFG, band=band_range)
-        kept_records, X_bp, y, groups = compute_bandpower_matrix(records, signal_cache, CFG)
+        X_by_scale, y, groups = build_dataset_for_band(records, CFG, band=band_range)
         print(f"Usable recordings: {len(y)} "
-              f"({y.sum()} MDD, {len(y) - y.sum()} NC) | "
-              f"PLV included: {CFG.INCLUDE_PLV} | "
-              f"channels selected per outer fold: {CFG.N_CHANNELS_SELECT}/{CFG.N_CHANNELS}")
+              f"(feature dim per scale: {X_by_scale[CFG.SCALES_SEC[0]].shape[1]}, "
+              f"PLV included: {CFG.INCLUDE_PLV})")
+        X_full = np.concatenate([X_by_scale[s] for s in CFG.SCALES_SEC], axis=1)
 
         pooled, summary, fold_results, pooled_arrays = run_nested_cv_for_band(
-            band_name, band_range, kept_records, signal_cache, X_bp, y, groups, CFG
+            band_name, X_full, y, groups, CFG
         )
         pooled_y_true, pooled_y_pred, pooled_y_score = pooled_arrays
 
@@ -940,22 +888,12 @@ def main():
             print(f"{key}: {summary[f'{key}_mean']:.3f} +/- {summary[f'{key}_std']:.3f}")
         print(f"klein_saturation_rate: {summary['saturation_rate_mean']:.3f} "
               f"+/- {summary['saturation_rate_std']:.3f}")
-        print(f"\nChannel-selection frequency across all {len(fold_results)} outer folds "
-              f"({band_name}) -- channels chosen most often across dev-only ANOVA reruns:")
-        for ch, count in summary["channel_selection_frequency"].items():
-            print(f"  {ch:>5s}: selected in {count}/{len(fold_results)} folds")
 
         print(f"\n--- Pooled classification report ({band_name}) ---")
         print(classification_report(pooled_y_true, pooled_y_pred, target_names=["Healthy", "MDD"]))
 
         save_band_result(CFG, band_name, summary, pooled_arrays)
         show_confusion_matrix(band_name, pooled_y_true, pooled_y_pred)
-
-        # free the per-band signal cache before moving to the next band
-        del signal_cache
-
-    band_bar.close()
-    print(f"\n[TIMING] full run ({len(bands_to_run)} band(s)) total: {_fmt_secs(time.time() - run_t0)}")
 
     all_summaries, pooled_scores_by_band = load_all_saved_band_results(CFG)
     if not all_summaries:
@@ -967,7 +905,7 @@ def main():
 
     comparison_df = build_comparison_table(all_summaries)
     print("\n" + "=" * 100)
-    print(f"BAND COMPARISON (Logistic Regression, MODMA-128) — {len(all_summaries)}/5 bands completed so far")
+    print(f"BAND COMPARISON (Logistic Regression) — {len(all_summaries)}/5 bands completed so far")
     print("=" * 100)
     try:
         from tabulate import tabulate
@@ -976,7 +914,7 @@ def main():
         print(comparison_df.to_string(index=False))
 
     os.makedirs(CFG.SAVE_DIR, exist_ok=True)
-    csv_path = os.path.join(CFG.SAVE_DIR, "band_comparison_logreg_modma128.csv")
+    csv_path = os.path.join(CFG.SAVE_DIR, "band_comparison_logreg.csv")
     comparison_df.to_csv(csv_path, index=False)
     print(f"\nSaved comparison table to {os.path.abspath(csv_path)}")
 
