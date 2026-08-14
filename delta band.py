@@ -64,8 +64,8 @@ class CONFIG:
     SATURATION_MARGIN: float = 0.95                      # boundary-proximity threshold for the saturation-rate diagnostic
     SELECT_K_GRID: Tuple = (30, 60, 120, "all")
     N_OUTER_FOLDS: int = 5                                # outer loop: unbiased performance estimate
-    N_INNER_FOLDS: int = 5                                # inner loop: hyperparameter + threshold tuning
-    N_REPEATS: int = 5                                    # outer (external) evaluation repeated 5x with fresh folds
+    N_INNER_FOLDS: int = 3                                # inner loop: hyperparameter + threshold tuning
+    N_REPEATS: int = 3                                    # outer (external) evaluation repeated 5x with fresh folds
     N_BAGGING_ESTIMATORS: int = 31                        # bagged over bootstrap resamples of the dev set
     BAGGING_MAX_SAMPLES: float = 0.9                      # fraction of dev set each bagged estimator trains on
     SEED: int = 42
