@@ -4,7 +4,7 @@ RubricMarkov-MRI (OASIS-2) -- ONE FILE: raw-MRI atrophy emissions (GPU) + contin
 forecasting and network-coupled spread (autograd/GPU likelihood).  Works in Kaggle / Colab / Jupyter / `python file.py`.
 NO argparse: edit the CONFIG block and run.
 
-IMAGING PIPELINE v4 (what changed vs. v3; the Markov / staging / spread code is UNCHANGED)
+IMAGING PIPELINE v4 (the Markov / staging / spread code is UNCHANGED)
   * REAL SKULL-STRIP MASK: SynthStrip (primary) -> HD-BET (backup) are auto-installed if missing (AUTO_INSTALL=True, needs Kaggle
     Internet) and REQUIRE_MASK=True by default, so the heuristic mask is NEVER used.  If the stripper dies mid-run the run stops
     (finished scans are cached) instead of silently skipping every scan.  Bad masks are never cached; masks < 10k voxels are rejected.
@@ -13,6 +13,14 @@ IMAGING PIPELINE v4 (what changed vs. v3; the Markov / staging / spread code is 
     CNR QC term; atlas lateral-ventricle sanity check; anatomical montages.
   If you change anything in the imaging block, DELETE OUT/mri (cached features / slices / masks / qwen_raw.csv) and rerun.
   !! If you previously ran with heuristic masks:  !rm -rf rm_out/mri   before the first run of this version.
+
+QWEN STEP v5 (NEW): Qwen3-VL as a TOOL-INTEGRATED agent (CineMR, arXiv 2610.01166) instead of direct montage -> digit scoring.
+  The VLM sees a skull-stripped montage, states an imaging hypothesis, calls image-analysis tools (segment_brain -> measure_tissue ->
+  compute_atrophy_metrics, optional zoom_anatomy), integrates the returned measurements in interleaved <think>/<tool_call>/<tool_result>
+  reasoning, applies an encoded rule book (atrophy percentile -> ordinal 0-3, QWEN_CUTS) and answers in \\boxed{...}.  Rollouts are
+  sampled (temperature) and aggregated; correct-tool-call rate and rule-agreement pass@1/pass@K are logged and gate the rubrics.
+  OASIS nWBV / eTIV / CDR / MMSE / Group / age / sex are NEVER visible to the model or tools (nWBV is the independent validation target).
+  Needs transformers >= 4.57 (pip install -U transformers accelerate; restart the kernel).
 
 RUN modes
   "all"      = "mri" -> "validate" -> "qwen" -> "stage".  The one-click paper pipeline (qwen / validate are skipped with a
@@ -26,12 +34,11 @@ RUN modes
              weight `qc_conf` (Dice of two half-average segmentations, NCC, volume plausibility, tissue contrast).
   "validate" agreement of the intensity-based tissue measures with OASIS nWBV/eTIV (rank) and, if REF_CSV is given,
              with FreeSurfer / FSL references (Spearman + cluster-bootstrap CI, Lin's CCC, Bland-Altman).
-  "qwen"     Qwen2.5-VL reads the skull-stripped slice montages and scores 3 visual rubrics (ventricles, global cortical
-             atrophy, medial-temporal atrophy) in a CONSTRAINED answer format ('Score: <digit>', assistant prefill).  Scores =
-             expected value over the renormalised digit distribution; the FULL-vocabulary probability mass on the digits is
-             logged and used as a validity diagnostic / mask.  Per-rubric confidence = agreement of two independent slice
-             views x (1 - normalised entropy) x digit mass.  Rubrics are validated against INDEPENDENT anatomical measures
-             and are only used as emissions if they PASS.  The prompt contains NO demographics, cognition or diagnosis.
+  "qwen"     Qwen3-VL tool-integrated rubric assessment (see above): 3 rubrics (ventricles, global cortical atrophy, medial-temporal
+             atrophy) scored from tool outputs through the rule book; per-rubric confidence = rollout agreement x valid fraction x
+             tool-protocol rate.  Rubrics are validated (tool-protocol rate, rule agreement, rollout agreement, sign vs INDEPENDENT
+             nWBV with cluster-bootstrap CI) and are only used as emissions if they PASS.  Verbatim traces: OUT/mri/qwen_traces.jsonl.
+  "traces"   write rule-derived reference tool-interaction trajectories (JSONL, chat format) for LoRA SFT of Qwen3-VL (paper stage 1).
   "stage"    3-class subject outcome (Nondemented / Converted / Demented), visit-level CDR staging, forecasts,
              baselines, bootstrap CIs, progression curves, per-subject forecast table.
              PROSPECTIVE tasks (cutoff != None): the Markov model, all preprocessing statistics and all baselines see ONLY
@@ -50,11 +57,11 @@ Restarts: CV folds use ONE noise-free start; anything above MAX_RESTARTS is capp
 Kaggle/Colab:  %%writefile rubricmarkov_mri.py   then in a NEW cell   %run rubricmarkov_mri.py
 (enable Settings -> Accelerator -> GPU AND Settings -> Internet for the "mri" step: SynthStrip/HD-BET are pip-installed and
 their weights downloaded on first use.  Offline: attach synthstrip.1.pt as a dataset and set SYNTHSTRIP_MODEL, pre-install the
-packages, or use RUN="export" + MASK_DIR.)
+packages, or use RUN="export" + MASK_DIR.  The "qwen" step also needs Internet (or a locally attached Qwen3-VL model dir in QWEN_MODEL).)
 If you change MASK_DIR / BIAS / the pipeline, delete OUT/mri (cached features / slices / qwen_raw.csv) and rerun.
 """
 from __future__ import annotations
-import functools, glob, itertools, json, math, os, re, sys, time, warnings
+import functools, glob, itertools, json, math, os, re, sys, time, warnings, zlib
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -82,8 +89,8 @@ print = functools.partial(print, flush=True)
 
 # =============================================================================== CONFIG (edit here)
 CONFIG = dict(
-    RUN="all",                   # "all" | "export" | "mri" | "validate" | "qwen" | "stage" | "ablate" | "spread" | "synth"
-    XLSX=None,                   # path to oasis_longitudinal_demographics.xlsx (None = auto-search)
+    RUN="all",                   # "all" | "export" | "mri" | "validate" | "qwen" | "traces" | "stage" | "ablate" | "spread" | "synth"
+    XLSX="/kaggle/input/datasets/kinnarhalder1/oasis-2-demographics/oasis_longitudinal_demographics-8d83e569fa2e2d30.xlsx",   # None = auto-search
     OUT="rm_out",
     QUICK=False,                 # True = smoke run (3 folds x 1 repeat, 1 restart, 60 iters, 5 bootstraps)
     CUTOFFS=[None, 1.0],         # None = retrospective staging (all visits); 1.0 = PROSPECTIVE (see first 1.0 y, predict later)
@@ -101,8 +108,8 @@ CONFIG = dict(
     CONF_ON="image",             # "image": qc/VLM confidence tempers ONLY image-derived channels (nWBV, MRI, Qwen); "all": also MMSE/CDR (old behaviour)
     RETRO_ORACLE=False,          # True = also run retrospective Mode C, always labelled "C-ORACLE" (never a headline result)
     # ---- mri step
-    RAW_ROOTS=["/kaggle/input/datasets/kinnarhalder/oasis-2-1/OAS2_RAW_PART1",
-               "/kaggle/input/datasets/kinnarhalder/oasis-2-2/OAS2_RAW_PART2"],
+    RAW_ROOTS=["/kaggle/input/datasets/kinnarhalder1/oasis-2-1/OAS2_RAW_PART1",
+               "/kaggle/input/datasets/kinnarhalder1/oasis-2-2/OAS2_RAW_PART2"],
     CANONICAL=True,              # reorient every repeat (and external mask) to RAS before anything else (anatomical montages, atlas frame)
     ALIGN="phase",               # repeat alignment: "phase" (GPU integer phase-correlation, sign-verified) | "rigid" (+ ANTs rigid refinement, slower)
     MASK_DIR=None,               # <MRI ID>.nii.gz (or _mask / _bet_mask / _brain_mask) brain masks from SynthStrip / HD-BET -> paper-grade
@@ -126,13 +133,20 @@ CONFIG = dict(
     ATLAS_MIN_DICE=0.80,         # Dice(SyN-warped MNI brain mask, subject brain mask) needed to use the atlas for that scan, else its regional values are missing
     ATLAS_MIN_VENT_CSF=0.35,     # mean CSF posterior inside the warped atlas lateral ventricles needed to accept the registration (ROI-level sanity check)
     VENT_BAND_MM=8.0,            # periventricular band (mm) around the atlas lateral ventricles used for vol_vent
-    # ---- qwen step (vision-language rubric scoring of the skull-stripped MRI; no demographics/diagnosis in the prompt)
-    QWEN_MODEL="Qwen/Qwen2.5-VL-3B-Instruct",   # HF id OR a local dir (Kaggle: attach a Qwen2.5-VL model, internet may be off)
-    QWEN_QUANT="fp16",           # "fp16" (3B fits a T4) | "4bit" (7B on a T4; needs bitsandbytes)
-    QWEN_MAX_PIXELS=640*28*28, QWEN_LIMIT=None,
-    QWEN_PREFILL="Score: ",      # forced answer format (assistant prefill) so the next token is the digit
-    QWEN_MIN_MASS=0.5,           # min FULL-vocab probability mass on digits 0-3, else the rubric is masked for that scan
-    QWEN_MIN_RHO=0.20,           # min |Spearman| vs independent anatomical measures for a rubric to be used as an emission
+    # ---- qwen step: Qwen3-VL TOOL-INTEGRATED rubric assessment (CineMR-style; no demographics/diagnosis/nWBV visible to model or tools)
+    QWEN_MODEL="Qwen/Qwen3-VL-8B-Instruct",   # paper backbone; Qwen3-VL-4B/2B-Instruct also work; HF id OR a local dir (Kaggle: attach it, internet may be off)
+    QWEN_QUANT="auto",           # "auto" (fp16/bf16 if the model fits the GPU memory, else 4-bit) | "fp16" | "4bit" (needs bitsandbytes)
+    QWEN_IMG=672,                # montage side in px (multiple of 32 = Qwen3-VL patch grid)
+    QWEN_ROLLOUTS=2,             # sampled rollouts per scan, alternating slice views A/B (paper evaluates with 4; cost is linear)
+    QWEN_TEMP=0.7, QWEN_TOP_P=0.95,   # sampling (paper: temperature 0.7); QWEN_TEMP=0 -> greedy
+    QWEN_MAX_NEW=320,            # max new tokens per assistant turn
+    QWEN_MAX_TURNS=6,            # max assistant turns per rollout (3 required tools + optional zoom + final answer)
+    QWEN_LIMIT=None,
+    QWEN_CUTS=(0.30, 0.60, 0.85),# rule book: atrophy percentile (label-free rank in the cohort) -> ordinal 0 / 1 / 2 / 3
+    QWEN_MIN_VALID=0.5,          # min fraction of valid (tool-grounded) rollouts for a scan's rubric value to be kept
+    QWEN_MIN_PROTO=0.8,          # gate: min correct-tool-call rate (exact gold tool chain, in order, grounded answer)
+    QWEN_MIN_RULE=0.5,           # gate: min rule-book agreement (pass@1) of the model's answers
+    QWEN_MIN_RHO=0.20,           # gate: min |Spearman| vs the INDEPENDENT OASIS nWBV for a rubric to be used as an emission
     # ---- spread only
     REGIONAL_CSV=None, REGIONS_LIST="mtl,frontal,parietal,vent", W_CSV=None, CENTROIDS_CSV=None,
     USE_RUBRICS=False, SPREAD_STEPS=150, N_SHUFFLE=3, BETA_BOOT=0,
@@ -1875,7 +1889,7 @@ def save_png(path, mean, brain, labels, title):
 
 def render_montage(mean, brain, zooms, offs, size=224):
     """3x3 grayscale montage (rows = sagittal / coronal / axial for RAS data, cols = 3 slice offsets as fractions of the brain bbox),
-    skull-stripped, physically scaled for anisotropic voxels, drawn with superior up.  This is what Qwen-VL sees."""
+    skull-stripped, physically scaled for anisotropic voxels, drawn with superior up.  This is what Qwen3-VL sees."""
     from PIL import Image
     idx = np.argwhere(brain); lo, hi = idx.min(0), idx.max(0); c = (lo + hi) / 2; ext = hi - lo
     vmax = max(np.percentile(mean[brain], 99.5), 1e-6); img = np.clip(np.where(brain, mean, 0.0) / vmax, 0, 1)
@@ -1893,7 +1907,7 @@ def render_montage(mean, brain, zooms, offs, size=224):
     return Image.fromarray(np.concatenate(rows, 0)).convert("RGB")
 
 
-VIEWS = {"A": (-0.15, 0.0, 0.15), "B": (-0.25, -0.07, 0.10)}     # two independent slice sets -> agreement = Qwen QC
+VIEWS = {"A": (-0.15, 0.0, 0.15), "B": (-0.25, -0.07, 0.10)}     # two independent slice sets -> rollouts alternate them (agreement = Qwen QC)
 
 
 def cmd_export(a):
@@ -2026,115 +2040,403 @@ def cmd_validate(a):
     print("\nTissue-measure validation:\n", res.round(3).to_string(index=False))
 
 
-# =============================================================================== Qwen2.5-VL rubric scoring
+# =============================================================================== Qwen3-VL TOOL-INTEGRATED rubric assessment (CineMR-style)
+# (v5) Qwen3-VL tool-integrated rubric assessment; replaces the former direct montage -> digit-logit scoring.
+#
+# Paper -> brain-MRI mapping (CineMR, arXiv 2610.01166)
+#   VLM backbone Qwen3-VL-8B-Instruct ........ Qwen3-VL (QWEN_MODEL), sampled rollouts (temperature 0.7)
+#   interleaved <think>/<tool_call>/<tool_result>  3-phase trace: (1) imaging hypothesis, (2) tool-integrated quantification,
+#                                                  (3) criterion-based verification + \boxed{...} answer
+#   cardiac tool suite (dependency chain) ..... segment_brain -> measure_tissue -> compute_atrophy_metrics (+ aux zoom_anatomy)
+#   Rule-Based Cardiac Phenotype Classifier ... RUBRIC RULE BOOK: atrophy percentile -> ordinal 0-3 via QWEN_CUTS (encoded in the
+#                                                system prompt; also the deterministic reference policy)
+#   pass@k / correct-tool-call-rate ............ rule-agreement pass@1 / pass@K and correct-tool-call rate (logged, used as validity gates)
+#   Stage-1 SFT traces ......................... RUN="traces" writes reference trajectories (JSONL) for LoRA SFT (rule-derived, label-free)
+#
+# What the tools may and may not expose: the tools read ONLY image-derived measures from the mri step (csf_icv, vent_icv, gm_deficit,
+# bpf, atlas ventricle / MTL / hippocampus fractions).  OASIS nWBV, eTIV, CDR, MMSE, Group, age and sex are NEVER visible to the model or
+# the tools, so nWBV remains an INDEPENDENT validation target.  Percentiles are label-free (rank among all scans of the cohort).
+#
+# NOTE (honest caveat, same as the paper's Table 2): an UN-fine-tuned Qwen3-VL follows the tool protocol imperfectly (paper: 1.5% pass@1
+# for the un-tuned backbone with a tool-aware prompt).  The step therefore (i) enforces the protocol in the runtime, (ii) logs
+# correct-tool-call rate and rule agreement, (iii) masks rollouts that are not tool-grounded, and (iv) only lets a rubric become an
+# emission if it passes the gates in report_qwen_validity.  If tool-call rate is low, run RUN="traces" and LoRA-SFT on the traces.
+
+QV = "qwen3vl-tools-v1"                                    # cache schema marker: old qwen_raw.csv files are discarded
 RUBRICS = {"vent": "enlargement of the lateral ventricles",
-           "gca": "global cortical atrophy (widening of the cortical sulci and thinning of the gyri)",
-           "mta": "medial temporal lobe atrophy (shrinkage of the hippocampus with widening of the temporal horn and choroid fissure)"}
-PROMPT = ("You are assisting with a research study. The image is a montage of nine skull-stripped T1-weighted brain MRI "
-          "slices (three orthogonal planes, three slices each; orientation may be arbitrary). Rate the {what} on an ordinal "
-          "scale: 0 = none, 1 = mild, 2 = moderate, 3 = severe. Answer in the exact format 'Score: <digit>'.")
+           "gca": "global cortical atrophy (widening of the cortical sulci, thinning of the gyri)",
+           "mta": "medial temporal lobe atrophy (hippocampal / parahippocampal / amygdalar shrinkage)"}
+PCT_KEYS = {"vent": "ventricular_enlargement_pctile", "gca": "global_cortical_atrophy_pctile",
+            "mta": "medial_temporal_atrophy_pctile"}
+GOLD_CHAIN = ("segment_brain", "measure_tissue", "compute_atrophy_metrics")      # required, in dependency order
+AUX_TOOLS = ("zoom_anatomy",)                                                    # optional (visual detail only)
+HI_IS_ATROPHY = {"csf_icv": True, "vent_icv": True, "gm_deficit": True, "vent_atlas_icv": True,
+                 "mtl_frac": False, "hipp_frac": False}                          # direction: True = higher value means more atrophy
+TOOL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
+BOXED_RE = re.compile(r"\\boxed\{\s*(\{.*?\})\s*\}", re.S)
+QUESTION = ("Assess ventricular enlargement (vent), global cortical atrophy (gca) and medial temporal atrophy (mta) for this scan. "
+            "Use the hypothesis-verification approach: state your initial imaging hypothesis, quantify it with the tools, "
+            "then verify each rubric against the scoring rules and give the final scores.")
+ZOOM = {"ventricles": (2, (0.20, 0.80, 0.20, 0.80)),      # target -> (montage row: 0 sagittal / 1 coronal / 2 axial, crop box x0,x1,y0,y1 as panel fractions)
+        "temporal":   (1, (0.20, 0.80, 0.40, 1.00)),
+        "cortex":     (2, (0.00, 1.00, 0.00, 1.00))}
+
+_SYSTEM_TEMPLATE = """You are a neuroimaging research assistant (research use only, not a diagnostic tool). The image is a montage of nine skull-stripped T1-weighted MRI slices (rows: sagittal, coronal, axial). Visual impressions are unreliable for grading atrophy, so you MUST obtain quantitative measurements with the tools and base every score on the returned numbers. You are given no demographics, cognition or diagnosis; never speculate about them.
+
+TOOLS - call exactly ONE per turn as <tool_call>{"name": "<tool>", "arguments": {...}}</tool_call>, then wait for the <tool_result>:
+1. segment_brain {}  -> segmentation status, mask source, scan QC confidence. Always call it first.
+2. measure_tissue {} -> CSF / ventricle / grey-matter-deficit / atlas fractions and their atrophy percentiles (needs 1).
+3. compute_atrophy_metrics {} -> rubric-level atrophy percentiles: ventricular_enlargement_pctile, global_cortical_atrophy_pctile, medial_temporal_atrophy_pctile (null = not measurable) (needs 2).
+4. zoom_anatomy {"target": "ventricles" | "temporal" | "cortex"} -> magnified slices (optional, needs 1).
+
+SCORING RULES (p = atrophy percentile in [0,1]; higher = more atrophy than the reference cohort):
+score 0 if p < <<C0>>;  score 1 if <<C0>> <= p < <<C1>>;  score 2 if <<C1>> <= p < <<C2>>;  score 3 if p >= <<C2>>;  null if the percentile is null.
+Mapping: vent <- ventricular_enlargement_pctile, gca <- global_cortical_atrophy_pctile, mta <- medial_temporal_atrophy_pctile.
+
+FORMAT
+Phase 1: <think>Hypothesis: ...</think>, then the first tool call.
+Phase 2: one tool call per turn; after each <tool_result> write a short <think>...</think> and make the next call.
+Phase 3: after compute_atrophy_metrics write <think>Verification 1: ... Verification 2: ... Verification 3: ... Conclusion: ...</think> and then the final answer on its own line, exactly:
+\\boxed{{"vent": <0-3 or null>, "gca": <0-3 or null>, "mta": <0-3 or null>}}
+Never give a score before all three required tools have returned.
+
+EXAMPLE of the format (all numbers are invented for illustration, never reuse them):
+<think>Hypothesis: the ventricles look somewhat enlarged. I need to quantify this with tools; first segment the brain.</think>
+<tool_call>{"name": "segment_brain", "arguments": {}}</tool_call>
+... (tool results and the two further calls) ...
+<think>Verification 1: ventricular_enlargement_pctile = 0.71 >= <<C1>> and < <<C2>> -> 2. Verification 2: global_cortical_atrophy_pctile = 0.40 -> 1. Verification 3: medial_temporal_atrophy_pctile = null -> null. Conclusion: rules applied.</think>
+\\boxed{{"vent": 2, "gca": 1, "mta": null}}"""
 
 
+def build_system_prompt(cuts):
+    s = _SYSTEM_TEMPLATE
+    for i, c in enumerate(cuts): s = s.replace(f"<<C{i}>>", f"{c:g}")
+    return s
+
+
+def band_of(p, cuts):
+    """the rule book: percentile -> ordinal 0..3 (None stays None)."""
+    return None if p is None else int(sum(p >= c for c in cuts))
+
+
+# ------------------------------------------------------------------ cohort reference (label-free percentiles) = the 'reference ranges'
+class Reference:
+    """Per-scan image measures + label-free cohort percentiles.  Never reads the OASIS table (nWBV / CDR / Group stay hidden)."""
+    def __init__(self, out, cuts):
+        f = pd.read_csv(f"{out}/mri_features.csv"); q = pd.read_csv(f"{out}/mri_qc.csv")
+        keep = [c for c in ("MRI ID", "icv_ml", "mask_src", "dice", "seg_cnr_min", "mask_suspect") if c in q]
+        d = f.merge(q[keep], on="MRI ID", how="left"); rp = f"{out}/regional.csv"
+        if os.path.exists(rp):
+            d = d.merge(pd.read_csv(rp), on="MRI ID", how="left")
+            if "vol_mtl" in d: d["mtl_frac"] = d["vol_mtl"] / (d["icv_ml"] * 1000.0)
+            if {"vol_L_Hippocampus", "vol_R_Hippocampus"} <= set(d):
+                d["hipp_frac"] = (d["vol_L_Hippocampus"] + d["vol_R_Hippocampus"]) / (d["icv_ml"] * 1000.0)
+                d["hipp_asym"] = (d["vol_L_Hippocampus"] - d["vol_R_Hippocampus"]) / (d["vol_L_Hippocampus"] + d["vol_R_Hippocampus"])
+        self.d = d.drop_duplicates("MRI ID").set_index("MRI ID"); self.cuts = tuple(cuts)
+        self.sorted = {c: np.sort(self.d[c].dropna().values.astype(float)) for c in HI_IS_ATROPHY if c in self.d}
+
+    def val(self, name, c):
+        if name not in self.d.index or c not in self.d.columns: return None
+        v = self.d.at[name, c]
+        return float(v) if pd.notna(v) else None
+
+    def pct(self, c, v):
+        s = self.sorted.get(c)
+        if s is None or len(s) < 20 or v is None or not np.isfinite(v): return None
+        p = 0.5 * (np.searchsorted(s, v, "left") + np.searchsorted(s, v, "right")) / len(s)      # mid-rank percentile
+        return float(p if HI_IS_ATROPHY[c] else 1.0 - p)
+
+    def rubric_pcts(self, name):
+        g = lambda c: self.pct(c, self.val(name, c))
+        mean = lambda l: round(float(np.mean(l)), 3) if l else None
+        vent = g("vent_atlas_icv"); vent = g("vent_icv") if vent is None else vent                # atlas ventricles when registered, else deep-CSF proxy
+        r3 = lambda x: None if x is None else round(x, 3)
+        return {"vent": r3(vent), "gca": mean([x for x in (g("csf_icv"), g("gm_deficit")) if x is not None]),
+                "mta": mean([x for x in (g("mtl_frac"), g("hipp_frac")) if x is not None])}
+
+    def rule_scores(self, name):
+        p = self.rubric_pcts(name)
+        return {r: {"pct": p[r], "band": band_of(p[r], self.cuts)} for r in RUBRICS}
+
+
+# ------------------------------------------------------------------ tool runtime (dependency chain enforced, like the paper's tool suite)
+class BrainToolRuntime:
+    def __init__(self, ref, sdir):
+        self.ref, self.sdir = ref, sdir; self.name = self.view = None; self.done = []; self.log = []
+
+    def start(self, name, view):
+        self.name, self.view, self.done, self.log = name, view, [], []
+
+    def call(self, tool, args):
+        img = None
+        try:
+            fn = getattr(self, "_t_" + str(tool), None) if tool in GOLD_CHAIN + AUX_TOOLS else None
+            res, img = fn(args if isinstance(args, dict) else {}) if fn else ({"status": "error", "message": f"unknown tool {tool!r}"}, None)
+        except Exception as e:
+            res = {"status": "error", "message": f"{type(e).__name__}: {e}"}
+        self.log.append((str(tool), res.get("status")))
+        if res.get("status") == "success" and tool not in self.done: self.done.append(tool)
+        return res, img
+
+    def _need(self, tool):
+        return None if tool in self.done else {"status": "error", "message": f"call {tool} first"}
+
+    def _t_segment_brain(self, args):
+        if self.name not in self.ref.d.index: return {"status": "error", "message": "scan not found"}, None
+        r = self.ref.d.loc[self.name]; g = lambda c: (None if c not in r.index or pd.isna(r[c]) else r[c])
+        return {"status": "success", "segmentation": "<seg_mask>", "mask_source": g("mask_src"),
+                "qc_confidence": None if g("qc_conf") is None else round(float(g("qc_conf")), 3),
+                "brain_volume_ml": None if g("icv_ml") is None else round(float(g("icv_ml")), 1)}, None
+
+    def _t_measure_tissue(self, args):
+        e = self._need("segment_brain")
+        if e: return e, None
+        res = {"status": "success"}
+        for c in ("csf_icv", "vent_icv", "gm_deficit", "bpf", "vent_atlas_icv", "mtl_frac", "hipp_frac"):
+            v = self.ref.val(self.name, c); res[c] = None if v is None else round(v, 5)
+            if c in HI_IS_ATROPHY:
+                p = self.ref.pct(c, v); res[c + "_atrophy_pctile"] = None if p is None else round(p, 3)
+        return res, None
+
+    def _t_compute_atrophy_metrics(self, args):
+        e = self._need("measure_tissue")
+        if e: return e, None
+        p = self.ref.rubric_pcts(self.name); a = self.ref.val(self.name, "hipp_asym")
+        res = {"status": "success", **{PCT_KEYS[r]: p[r] for r in RUBRICS},
+               "hippocampal_lr_asymmetry": None if a is None else round(a, 3),
+               "note": "percentiles are ranks within the scanned cohort (higher = more atrophy); null = measure unavailable"}
+        return res, None
+
+    def _t_zoom_anatomy(self, args):
+        from PIL import Image
+        e = self._need("segment_brain")
+        if e: return e, None
+        t = str(args.get("target", ""))
+        if t not in ZOOM: return {"status": "error", "message": f"target must be one of {sorted(ZOOM)}"}, None
+        row, (x0, x1, y0, y1) = ZOOM[t]
+        im = Image.open(f"{self.sdir}/{self.name}_{self.view}.png").convert("RGB"); P = im.width // 3; tiles = []
+        for j in range(3):
+            tile = im.crop((int(j * P + x0 * P), int(row * P + y0 * P), int(j * P + x1 * P), int(row * P + y1 * P)))
+            tiles.append(tile.resize((P, P), Image.BICUBIC))
+        out = Image.new("RGB", (3 * P, P))
+        for j, tl in enumerate(tiles): out.paste(tl, (j * P, 0))
+        return {"status": "success", "target": t, "note": "magnified slices attached"}, out
+
+
+# ------------------------------------------------------------------ Qwen3-VL loading + interleaved generation
 def load_qwen(a):
+    """Qwen3-VL-*-Instruct (needs transformers>=4.57).  QWEN_QUANT: 'auto' (fp16/bf16 if the model fits the GPU memory, else 4-bit) | 'fp16' | '4bit'."""
     _need_torch()
-    from transformers import AutoProcessor
-    kw = dict(torch_dtype=torch.float16, device_map="auto")
-    if a.QWEN_QUANT == "4bit":
+    try:
+        from transformers import AutoProcessor
+        if re.search(r"A\d+B", a.QWEN_MODEL):
+            from transformers import Qwen3VLMoeForConditionalGeneration as M
+        else:
+            from transformers import Qwen3VLForConditionalGeneration as M
+    except ImportError:
+        raise SystemExit("Qwen3-VL needs a recent transformers:  pip install -U 'transformers>=4.57' accelerate   (restart the kernel afterwards)")
+    quant = a.QWEN_QUANT
+    if quant == "auto":
+        gb = sum(torch.cuda.get_device_properties(i).total_memory for i in range(torch.cuda.device_count())) / 1e9 if torch.cuda.is_available() else 0.0
+        m = re.search(r"(\d+(?:\.\d+)?)B", a.QWEN_MODEL); need = 2.4 * float(m.group(1)) if m else 20.0   # fp16 weights + activations/KV headroom
+        quant = "fp16" if gb >= need else "4bit"
+        print(f"[qwen] {a.QWEN_MODEL}: {gb:.0f} GB GPU memory vs ~{need:.0f} GB needed in fp16 -> {quant}")
+    bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+    kw = dict(dtype=torch.bfloat16 if bf16 else torch.float16, device_map="auto")
+    if quant == "4bit":
         from transformers import BitsAndBytesConfig
-        kw["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
-                                                       bnb_4bit_quant_type="nf4")
-    if "Qwen2-VL" in a.QWEN_MODEL:
-        from transformers import Qwen2VLForConditionalGeneration as M
-    else:
-        from transformers import Qwen2_5_VLForConditionalGeneration as M
+        kw["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=kw["dtype"], bnb_4bit_quant_type="nf4")
     model = M.from_pretrained(a.QWEN_MODEL, **kw).eval()
-    proc = AutoProcessor.from_pretrained(a.QWEN_MODEL, max_pixels=a.QWEN_MAX_PIXELS)
-    ids = [proc.tokenizer.encode(str(i), add_special_tokens=False)[0] for i in range(4)]
-    return model, proc, ids
+    proc = AutoProcessor.from_pretrained(a.QWEN_MODEL)
+    return model, proc
+
+
+def _generate(model, proc, msgs, a):
+    """one assistant turn; stops right after </tool_call> so the runtime can execute the tool and insert the result (interleaved reasoning)."""
+    inp = proc.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt").to(model.device)
+    gen = dict(max_new_tokens=int(a.QWEN_MAX_NEW), stop_strings=["</tool_call>"], tokenizer=proc.tokenizer)
+    if a.QWEN_TEMP > 0: gen.update(do_sample=True, temperature=float(a.QWEN_TEMP), top_p=float(a.QWEN_TOP_P))
+    else: gen.update(do_sample=False)
+    out = model.generate(**inp, **gen)
+    return proc.batch_decode(out[:, inp["input_ids"].shape[1]:], skip_special_tokens=True)[0]
 
 
 @_ng
-def qwen_score(model, proc, ids, img, what, prefill):
-    """Constrained format (assistant prefill 'Score: ') so the next token IS the digit. Returns
-       E[s] over the digits (renormalised), its normalised entropy, and the FULL-vocabulary probability mass on {0..3}.
-       The mass is the validity diagnostic: low mass => the renormalised distribution is not trustworthy."""
-    msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": PROMPT.format(what=what)}]}]
-    text = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True) + prefill
-    inp = proc(text=[text], images=[img], return_tensors="pt").to(model.device)
-    full = torch.softmax(model(**inp).logits[0, -1].float(), 0)                  # FULL vocabulary
-    pdig = full[ids]; mass = float(pdig.sum()); p = (pdig / pdig.sum().clamp_min(1e-12)).cpu().numpy()
-    return float((p * np.arange(4)).sum()), float(-(p * np.log(p + 1e-12)).sum() / np.log(4)), mass
+def run_rollout(model, proc, rt, name, view, a, seed):
+    """One sampled tool-integrated rollout -> dict(scores per rubric, ok, tool diagnostics, verbatim turns)."""
+    from PIL import Image
+    torch.manual_seed(seed); S = int(a.QWEN_IMG)
+    img = Image.open(f"{rt.sdir}/{name}_{view}.png").convert("RGB").resize((S, S), Image.BICUBIC)
+    msgs = [{"role": "system", "content": [{"type": "text", "text": build_system_prompt(a.QWEN_CUTS)}]},
+            {"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": QUESTION}]}]
+    rt.start(name, view); turns, calls, final, malformed = [], [], None, 0
+    for _ in range(int(a.QWEN_MAX_TURNS)):
+        txt = _generate(model, proc, msgs, a); m = TOOL_RE.search(txt)
+        if m:
+            txt = txt[:m.end()]; turns.append(txt); msgs.append({"role": "assistant", "content": [{"type": "text", "text": txt}]})
+            try:
+                c = json.loads(m.group(1)); tool, args = str(c.get("name")), (c.get("arguments") or {})
+            except Exception:
+                tool, args, malformed = "<malformed>", {}, malformed + 1
+            res, im = rt.call(tool, args); calls.append(tool)
+            content = [{"type": "text", "text": "<tool_result>" + json.dumps(res) + "</tool_result>"}]
+            if im is not None: content.append({"type": "image", "image": im})
+            msgs.append({"role": "user", "content": content}); continue
+        turns.append(txt); b = BOXED_RE.search(txt)
+        if b:
+            try: final = json.loads(b.group(1))
+            except Exception: final = None
+        break
+    chain = [t for t in rt.done if t in GOLD_CHAIN]
+    proto = bool(chain == list(GOLD_CHAIN) and malformed == 0 and isinstance(final, dict))     # exact gold tool set, in order, grounded answer
+    pcts = rt.ref.rubric_pcts(name); scores = {}
+    for r in RUBRICS:
+        v = final.get(r) if isinstance(final, dict) else None
+        ok = proto and pcts[r] is not None and isinstance(v, (int, float)) and not isinstance(v, bool) and int(v) == v and 0 <= v <= 3
+        scores[r] = float(v) if ok else np.nan                                                    # unmeasurable rubric -> NaN (null is the right answer)
+    return dict(scores=scores, proto=proto, n_turn=len(turns), calls=calls, malformed=malformed, view=view, turns=turns, final=final)
+
+
+# ------------------------------------------------------------------ aggregation over rollouts
+def aggregate_qwen(R, a, K):
+    """rollouts -> vlm_<r> (mean of valid rollouts, masked if too few), vlm_<r>_conf, vlm_<r>_mass (= valid fraction); + diagnostics."""
+    out = pd.DataFrame({"MRI ID": R["MRI ID"]}); rel = {}
+    proto = np.stack([pd.to_numeric(R[f"proto{k}"], errors="coerce").fillna(0).values for k in range(K)], 1)
+    for r in RUBRICS:
+        S = np.stack([pd.to_numeric(R[f"s{k}_{r}"], errors="coerce").values for k in range(K)], 1)
+        V = ~np.isnan(S); n = V.sum(1); n1 = np.maximum(n, 1)
+        mean = np.where(n > 0, np.where(V, S, 0.0).sum(1) / n1, np.nan)
+        var = np.where(n > 0, (np.where(V, S - mean[:, None], 0.0) ** 2).sum(1) / n1, np.nan)
+        frac = n / K; agree = np.where(n > 1, np.exp(-np.sqrt(np.nan_to_num(var)) / 0.5), 0.5)
+        out[f"vlm_{r}"] = np.where(frac >= a.QWEN_MIN_VALID, mean, np.nan)
+        out[f"vlm_{r}_conf"] = np.clip(agree * frac * proto.mean(1), 0.05, 1.0)
+        out[f"vlm_{r}_mass"] = frac
+        rule = pd.to_numeric(R[f"rule_{r}"], errors="coerce").values; has = ~np.isnan(rule)
+        hit = (S == rule[:, None]) & V
+        rel[r] = dict(rollout_rho=float(pd.Series(S[:, 0]).corr(pd.Series(S[:, 1]), method="spearman")) if K > 1 else np.nan,
+                      frac_valid=float((frac >= a.QWEN_MIN_VALID)[has].mean()) if has.any() else 0.0, tool_ok=float(proto.mean()),
+                      rule_pass1=float(hit[has].mean()) if has.any() else np.nan,
+                      rule_passK=float(hit[has].any(1).mean()) if has.any() else np.nan, n_scans=int(has.sum()))
+        print(f"  vlm_{r}: tool-protocol OK in {100*rel[r]['tool_ok']:.0f}% of rollouts | valid scans {100*rel[r]['frac_valid']:.0f}% | "
+              f"rule agreement pass@1={rel[r]['rule_pass1']:.3f} pass@{K}={rel[r]['rule_passK']:.3f} | rollout rho={rel[r]['rollout_rho']:.3f}")
+    return out, rel
+
+
+def _scan_ids(sdir, ref, limit):
+    ids = sorted({os.path.basename(p).rsplit("_", 1)[0] for p in glob.glob(f"{sdir}/*_A.png")})
+    return [i for i in ids if i in ref.d.index][:limit]
 
 
 def cmd_qwen(a):
-    from PIL import Image
-    out = f"{a.OUT}/mri"; sdir = f"{out}/slices"; mf = f"{out}/mri_features.csv"
-    assert os.path.exists(mf), "run RUN='mri' first (it writes mri_features.csv and the slice montages)"
-    ids_all = sorted({os.path.basename(p).rsplit("_", 1)[0] for p in glob.glob(f"{sdir}/*_A.png")})[: a.QWEN_LIMIT]
-    rp = f"{out}/qwen_raw.csv"
+    out = f"{a.OUT}/mri"; sdir = f"{out}/slices"; mf = f"{out}/mri_features.csv"; K = int(a.QWEN_ROLLOUTS)
+    assert os.path.exists(mf) and os.path.exists(f"{out}/mri_qc.csv"), "run RUN='mri' first (mri_features.csv, mri_qc.csv, slice montages)"
+    ref = Reference(out, a.QWEN_CUTS); rt = BrainToolRuntime(ref, sdir); ids_all = _scan_ids(sdir, ref, a.QWEN_LIMIT)
+    rp, tp = f"{out}/qwen_raw.csv", f"{out}/qwen_traces.jsonl"
     raw = pd.read_csv(rp).to_dict("records") if os.path.exists(rp) else []
-    if raw and "vent_A_M" not in raw[0]:
-        print("  old qwen_raw.csv (no digit-mass column / unconstrained prompt) -> discarded and rescored"); raw = []
+    if raw and (raw[0].get("qv") != QV or raw[0].get("qmodel") != a.QWEN_MODEL or raw[0].get("qK") != K or raw[0].get("qcuts") != str(tuple(a.QWEN_CUTS))):
+        print("  qwen_raw.csv comes from another model / schema / rollout count / cuts -> discarded and rescored"); raw = []
+        if os.path.exists(tp): os.remove(tp)
     done = {r["MRI ID"] for r in raw}; todo = [i for i in ids_all if i not in done]
-    print(f"Qwen: {len(ids_all)} montage sets, {len(done)} done, {len(todo)} to score with {a.QWEN_MODEL} ({a.QWEN_QUANT})")
+    print(f"Qwen3-VL tool-integrated: {len(ids_all)} scans, {len(done)} done, {len(todo)} to run | {a.QWEN_MODEL} | "
+          f"{K} rollouts/scan, T={a.QWEN_TEMP}, cuts={tuple(a.QWEN_CUTS)}")
     if todo:
-        model, proc, ids = load_qwen(a); t0 = time.time()
-        for n, name in enumerate(todo, 1):
-            row = {"MRI ID": name}
-            for v in VIEWS:
-                img = Image.open(f"{sdir}/{name}_{v}.png")
-                for r, what in RUBRICS.items():
-                    e, h, m = qwen_score(model, proc, ids, img, what, a.QWEN_PREFILL)
-                    row[f"{r}_{v}"] = e; row[f"{r}_{v}_H"] = h; row[f"{r}_{v}_M"] = m
-            raw.append(row)
-            if n % 20 == 0:
-                pd.DataFrame(raw).to_csv(rp, index=False); print(f"  {n}/{len(todo)} ({(time.time()-t0)/n:.1f}s/scan)")
+        model, proc = load_qwen(a); t0 = time.time(); views = list(VIEWS)
+        with open(tp, "a") as tf:
+            for n, name in enumerate(todo, 1):
+                row = {"MRI ID": name, "qv": QV, "qmodel": a.QWEN_MODEL, "qK": K, "qcuts": str(tuple(a.QWEN_CUTS))}
+                for r, v in ref.rule_scores(name).items():
+                    row[f"rule_{r}"] = np.nan if v["band"] is None else v["band"]; row[f"pct_{r}"] = np.nan if v["pct"] is None else v["pct"]
+                for k in range(K):
+                    view = views[k % len(views)]                                          # rollouts alternate the two independent slice sets (A / B)
+                    res = run_rollout(model, proc, rt, name, view, a, seed=int(a.SEED) * 1000003 + zlib.crc32(name.encode()) % 100000 + k)
+                    row[f"proto{k}"] = int(res["proto"]); row[f"nturn{k}"] = res["n_turn"]; row[f"view{k}"] = view
+                    for r in RUBRICS: row[f"s{k}_{r}"] = res["scores"][r]
+                    tf.write(json.dumps(dict(id=name, rollout=k, view=view, tool_calls=res["calls"], malformed=res["malformed"],
+                                             final=res["final"], turns=res["turns"])) + "\n")
+                raw.append(row); tf.flush()
+                if n % 10 == 0:
+                    pd.DataFrame(raw).to_csv(rp, index=False); print(f"  {n}/{len(todo)} ({(time.time()-t0)/n:.1f}s/scan)")
         pd.DataFrame(raw).to_csv(rp, index=False)
         del model; torch.cuda.empty_cache()
     R = pd.DataFrame(raw); feats = pd.read_csv(mf)
-    out_df = pd.DataFrame({"MRI ID": R["MRI ID"]}); rel = {}
-    for r in RUBRICS:
-        ea, eb = R[f"{r}_A"], R[f"{r}_B"]; hbar = 0.5 * (R[f"{r}_A_H"] + R[f"{r}_B_H"]); mbar = np.minimum(R[f"{r}_A_M"], R[f"{r}_B_M"])
-        score = 0.5 * (ea + eb)
-        out_df[f"vlm_{r}"] = score.where(mbar >= a.QWEN_MIN_MASS)                          # low digit-mass => masked, not imputed
-        out_df[f"vlm_{r}_conf"] = np.clip(np.exp(-(ea - eb).abs() / 0.75) * (1 - hbar) * mbar, 0.05, 1.0)
-        out_df[f"vlm_{r}_mass"] = mbar
-        rel[r] = dict(view_rho=float(ea.corr(eb, method="spearman")), mean_mass=float(mbar.mean()),
-                      frac_valid=float((mbar >= a.QWEN_MIN_MASS).mean()))
-        print(f"  vlm_{r}: view A-vs-B Spearman = {rel[r]['view_rho']:.3f} | mean digit mass = {rel[r]['mean_mass']:.3f} "
-              f"| valid scans = {100*rel[r]['frac_valid']:.0f}% | mean conf = {out_df[f'vlm_{r}_conf'].mean():.3f}")
+    out_df, rel = aggregate_qwen(R, a, K)
     merged = feats.merge(out_df, on="MRI ID", how="left"); merged.to_csv(f"{out}/features_all.csv", index=False)
-    print(f"-> {out}/features_all.csv  (MRI geometry + Qwen rubrics + per-channel confidences / digit mass)")
+    print(f"-> {out}/features_all.csv  (MRI geometry + tool-integrated Qwen3-VL rubrics + confidences) | verbatim traces: {tp}")
     report_qwen_validity(a, merged, rel)
 
 
-# expected direction of each rubric vs INDEPENDENT anatomical measures (higher rubric = more atrophy)
-EXPECT = {"vent": [("vent_icv", +1), ("nWBV", -1)], "gca": [("csf_icv", +1), ("nWBV", -1)], "mta": [("vent_icv", +1), ("nWBV", -1)]}
+# ------------------------------------------------------------------ Stage-1 SFT data (paper: cold-start SFT on reference tool-interaction traces)
+def verification_text(res, cuts):
+    names = {"vent": "ventricular enlargement", "gca": "global cortical atrophy", "mta": "medial temporal atrophy"}
+    lines, box = ["<think>"], {}
+    for i, (r, key) in enumerate(PCT_KEYS.items(), 1):
+        p = res.get(key); b = band_of(p, cuts); box[r] = b
+        lines.append(f"Verification {i}: {names[r]} percentile = {p} -> " + (f"score {b} (cuts {list(cuts)})." if b is not None else "not measurable -> null."))
+    lines.append("Conclusion: scores follow the encoded rules.</think>")
+    return "\n".join(lines) + "\n\\boxed{" + json.dumps(box) + "}"
+
+
+def reference_trajectory(rt, name, view, a):
+    rt.start(name, view); cuts = a.QWEN_CUTS
+    msgs = [{"role": "system", "content": build_system_prompt(cuts)},
+            {"role": "user", "content": [{"type": "image", "image": f"{rt.sdir}/{name}_{view}.png"}, {"type": "text", "text": QUESTION}]}]
+    thinks = ["<think>Hypothesis: ventricular size, sulcal widening and medial temporal atrophy cannot be graded reliably by eye. "
+              "I need to quantify them with tools; first segment the brain.</think>",
+              "<think>Segmentation complete. Now measure the tissue fractions.</think>",
+              "<think>Tissue measures obtained. Now aggregate them into rubric-level atrophy percentiles.</think>"]
+    res = None
+    for tool, th in zip(GOLD_CHAIN, thinks):
+        msgs.append({"role": "assistant", "content": f"{th}\n<tool_call>" + json.dumps({"name": tool, "arguments": {}}) + "</tool_call>"})
+        res, _ = rt.call(tool, {})
+        if res.get("status") != "success": return None
+        msgs.append({"role": "user", "content": "<tool_result>" + json.dumps(res) + "</tool_result>"})
+    msgs.append({"role": "assistant", "content": verification_text(res, cuts)})
+    return {"id": f"{name}_{view}", "messages": msgs}
+
+
+def cmd_traces(a):
+    """RUN='traces': rule-derived reference trajectories (JSONL, chat 'messages' format, image paths) for LoRA SFT of Qwen3-VL.
+    Labels come from the image-derived rule book only (no OASIS Group / CDR / nWBV), so SFT cannot leak diagnosis information."""
+    out = f"{a.OUT}/mri"; sdir = f"{out}/slices"; ref = Reference(out, a.QWEN_CUTS); rt = BrainToolRuntime(ref, sdir); n = 0
+    with open(f"{out}/qwen_sft_traces.jsonl", "w") as f:
+        for name in _scan_ids(sdir, ref, a.QWEN_LIMIT):
+            for view in VIEWS:
+                rec = reference_trajectory(rt, name, view, a)
+                if rec: f.write(json.dumps(rec) + "\n"); n += 1
+    print(f"wrote {n} reference trajectories -> {out}/qwen_sft_traces.jsonl  (split BY SUBJECT before SFT; then evaluate with RUN='qwen')")
+
+
+# ------------------------------------------------------------------ validity gates
+# nWBV (OASIS) is INDEPENDENT of everything the model / tools see, so it is the validation target.  (csf_icv / vent_icv / atlas measures are
+# tool inputs: correlating the rubrics with them would be circular and is deliberately not used.)
+EXPECT = {r: [("nWBV", -1)] for r in RUBRICS}
 
 
 def report_qwen_validity(a, merged, rel):
-    """Labels are NEVER shown to Qwen and NOT used here for gating. A rubric passes only if (i) the two slice views agree,
-    (ii) enough full-vocab mass sits on the digits, (iii) every expected association with an independent measure has the right
-    sign, a subject-cluster-bootstrap CI excluding 0 and |rho| >= QWEN_MIN_RHO. Failing rubrics are NOT used as emissions."""
+    """A rubric becomes an emission only if (i) the correct tool chain was used in >= QWEN_MIN_PROTO of rollouts, (ii) its answers agree with the
+    encoded rule book (pass@1 >= QWEN_MIN_RULE), (iii) rollouts on the two slice sets agree (rho >= 0.3), (iv) enough scans are valid and
+    (v) it has the expected sign vs the INDEPENDENT nWBV, with a subject-cluster-bootstrap CI excluding 0 and |rho| >= QWEN_MIN_RHO."""
     d = load_table(find_table(a.XLSX)).merge(merged, left_on="mri", right_on="MRI ID", how="inner"); rows = []
-    print("\nQwen rubric validity (independent anatomical measures; subject-cluster bootstrap CIs):")
+    print("\nQwen3-VL rubric validity (independent target: OASIS nWBV, never shown to the model; subject-cluster bootstrap CIs):")
     for r in RUBRICS:
-        c = f"vlm_{r}"; good = []; start = len(rows)
-        for ref, sg in EXPECT[r]:
-            rho, lo, hi, n = _assoc_ci(d, c, ref)
+        c = f"vlm_{r}"; good = []; start = len(rows); x = rel[r]
+        for ref_, sg in EXPECT[r]:
+            rho, lo, hi, n = _assoc_ci(d, c, ref_)
             ok = (not np.isnan(rho)) and np.sign(rho) == sg and ((lo > 0) if sg > 0 else (hi < 0)) and abs(rho) >= a.QWEN_MIN_RHO
-            good.append(bool(ok)); rows.append(dict(rubric=r, reference=ref, expected_sign=sg, rho=rho, ci_lo=lo, ci_hi=hi, n=n, pair_ok=bool(ok)))
-            print(f"  {c} vs {ref}: rho={rho:+.3f} [{lo:+.3f},{hi:+.3f}] n={n} expected sign {sg:+d} -> {'ok' if ok else 'FAIL'}")
-        passed = bool(all(good) and rel[r]["view_rho"] >= 0.3 and rel[r]["mean_mass"] >= a.QWEN_MIN_MASS)
-        for x in rows[start:]:
-            x.update(view_rho=rel[r]["view_rho"], mean_mass=rel[r]["mean_mass"], rubric_pass=passed)
+            good.append(bool(ok)); rows.append(dict(rubric=r, reference=ref_, expected_sign=sg, rho=rho, ci_lo=lo, ci_hi=hi, n=n, pair_ok=bool(ok)))
+            print(f"  {c} vs {ref_}: rho={rho:+.3f} [{lo:+.3f},{hi:+.3f}] n={n} expected sign {sg:+d} -> {'ok' if ok else 'FAIL'}")
+        gates = dict(tool=x["tool_ok"] >= a.QWEN_MIN_PROTO, rule=(np.isnan(x["rule_pass1"]) or x["rule_pass1"] >= a.QWEN_MIN_RULE),
+                     rollout=(np.isnan(x["rollout_rho"]) or x["rollout_rho"] >= 0.3), valid=x["frac_valid"] >= 0.5)
+        passed = bool(all(good) and all(gates.values()))
+        for y in rows[start:]: y.update(rollout_rho=x["rollout_rho"], tool_ok=x["tool_ok"], rule_pass1=x["rule_pass1"], rule_passK=x["rule_passK"],
+                                        frac_valid=x["frac_valid"], rubric_pass=passed)
         okd = d[[c, "CDR"]].dropna()
-        if (okd["CDR"] > 0).nunique() > 1 and len(okd) > 20:
-            print(f"  {c}: [info only] AUC for CDR>0 = {roc_auc_score(okd['CDR'] > 0, okd[c]):.3f} | rubric {'PASSES' if passed else 'FAILS'} validation")
-        else:
-            print(f"  {c}: rubric {'PASSES' if passed else 'FAILS'} validation")
+        info = (f" | [info only] AUC for CDR>0 = {roc_auc_score(okd['CDR'] > 0, okd[c]):.3f}" if (okd["CDR"] > 0).nunique() > 1 and len(okd) > 20 else "")
+        gtxt = ", ".join(k + "=" + ("ok" if v else "FAIL") for k, v in gates.items())
+        print(f"  {c}: gates {gtxt} -> rubric {'PASSES' if passed else 'FAILS'} validation{info}")
     pd.DataFrame(rows).to_csv(f"{a.OUT}/mri/qwen_validity.csv", index=False)
-    print("  -> only rubrics marked PASS are attached as emissions; report failures as a negative result or use a larger / LoRA-tuned VLM.")
+    print("  -> only PASSING rubrics are attached as emissions. NOTE: the rubrics are a tool-mediated function of image measures already available to the "
+          "Markov model (vent_icv, ...); 'mta' adds the atlas MTL/hippocampus signal only when REGIONS=True. Low tool-protocol rate => RUN='traces' + LoRA SFT.")
 
 
 # =============================================================================== entry point
@@ -2178,7 +2480,9 @@ def main(overrides=None):
             try: cmd_qwen(a)
             except Exception as e:
                 if run == "qwen": raise
-                print(f"[qwen step skipped: {type(e).__name__}: {e}]\n  (no internet/model? attach a Qwen2.5-VL model and set QWEN_MODEL to its path; continuing without)")
+                print(f"[qwen step skipped: {type(e).__name__}: {e}]\n  (no internet / old transformers / no model? pip install -U 'transformers>=4.57', "
+                      f"or attach a Qwen3-VL model and set QWEN_MODEL to its path; continuing without)")
+    if run == "traces": cmd_traces(a)
     if run in ("all", "stage"):
         _attach_features(a)
         for cutoff in a.CUTOFFS:
@@ -2191,7 +2495,7 @@ def main(overrides=None):
         cmd_spread(a)
     elif run == "synth":
         cmd_synth(a)
-    elif run not in ("all", "mri", "qwen", "export", "validate"):
+    elif run not in ("all", "mri", "qwen", "traces", "export", "validate"):
         raise ValueError(f"unknown RUN={run!r}")
     print(f"\nTotal wall time {time.time()-t0:.0f}s")
 
